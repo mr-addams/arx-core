@@ -1,0 +1,151 @@
+# CI для arx-core: проверяем что библиотека собирается, проходит vet,
+# race-тесты, и что integration-only код компилируется под build-тегом.
+# Триггеримся на push/PR в main и dev (это две живые ветки согласно
+# git-flow модели репо) + ручной запуск через workflow_dispatch.
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+# Минимальные права: только чтение содержимого репо для checkout и go
+# (никаких write-разрешений CI не нужен — это не release workflow).
+permissions:
+  contents: read
+
+# Таймаут на верхнем уровне workflow: 30 минут на весь прогон.
+# По умолчанию GitHub Actions даёт 360 минут, что для библиотеки
+# избыточно и маскирует зависшие job'ы.
+timeout-minutes: 30
+
+jobs:
+  # ── 1. Базовая сборка + vet ───────────────────────────────────────────────
+  # Это gate-job: если build/vet падают, дальнейшие job'ы не запускаются.
+  # race-tests, tag-build-sanity и queue-backends все зависят от build.
+  build:
+    name: Build & vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        # Версия Go берётся из go.mod (поле `go 1.26`) — единый источник
+        # истины, чтобы не расходиться с тем, на чём собирают разработчики.
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+  # ── 2. Race-тесты (модульный прогон, без build-тегов) ────────────────────
+  # Запускаем только тесты, доступные без build-тега `integration` —
+  # это unit-тесты в pkg/executor/queue/ (bbolt_test.go, redis_test.go,
+  # queue_test.go) и тесты остальных пакетов. -race ловит гонки в
+  # NCS fan-in и очереди, -count=1 отключает кеш результатов.
+  race-tests:
+    name: Race tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: go test -race
+        # БЕЗ -tags integration: этот job гоняет только unit-тесты,
+        # которые компилируются в обычном режиме.
+        run: go test -race -count=1 ./...
+
+  # ── 3. Sanity-check сборки с тегом integration ──────────────────────────
+  # Проверяем что integration-only файлы (bbolt_integration_test.go,
+  # redis_integration_test.go) компилируются корректно. Тестов НЕ
+  # запускаем — для запуска нужен реальный Redis (это делает job
+  # queue-backends). Здесь только подтверждаем: build-тег не сломан.
+  tag-build-sanity:
+    name: Tag build sanity (integration tag)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: go build (без тегов)
+        # Идемпотентная проверка: обычная сборка должна проходить.
+        run: go build ./...
+
+      - name: go build -tags integration
+        # Подтверждаем что integration-блоки компилируются. Если
+        # кто-то сломал сигнатуру в integration-файле, упадёт здесь.
+        run: go build -tags integration ./...
+
+  # ── 4. Integration-тесты очередей (bbolt + redis) ───────────────────────
+  # bbolt использует t.TempDir() — внешних зависимостей не требует,
+  # просто файловая система, доступная всегда. Redis поднимается как
+  # GitHub Actions service container: runner гарантирует что сервис
+  # доступен по localhost:6379 (Docker-сеть GitHub пробрасывает порт
+  # на host), отсюда REDIS_URL=redis://localhost:6379/0 в env job'а.
+  queue-backends:
+    name: Queue backends (bbolt + redis)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        # health-cmd периодически проверяет что Redis жив; job стартует
+        # только после первого успешного ping, иначе тесты упадут на
+        # connection refused. --health-retries 5 даёт ~25с на подъём.
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run bbolt integration tests
+        # -run TestBboltIntegration сматчит все 6 кейсов:
+        # PersistenceAcrossManyReopens, FIFOUnderConcurrentPushers,
+        # LenAccuracyUnderMixedReadWrite, PopBlocksOnEmptyQueue,
+        # PushAfterCloseIsRejected, CorruptedBucketDetected.
+        # БЕЗ working-directory: arx-core теперь корень репо, не подпапка.
+        run: go test -tags integration -run TestBboltIntegration ./pkg/executor/queue/ -v -count=1
+
+      - name: Run redis integration tests
+        # -run TestRedisIntegration сматчит все 4 кейса:
+        # PushPopSmoke, SharedStateBetweenReplicas, PushAfterCloseIsRejected,
+        # ConcurrentAccess.
+        run: go test -tags integration -run TestRedisIntegration ./pkg/executor/queue/ -v -count=1

@@ -1,0 +1,44 @@
+# Release workflow для arx-core.
+# Триггерится ТОЛЬКО при push тега вида v* (например v0.1.0, v1.2.3).
+# arx-core — это библиотека: никаких бинарных артефактов, никакого
+# goreleaser; release = git tag + GitHub Release notes (генерируются
+# автоматически из PR'ов между тегами через --generate-notes).
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Нужен write на contents, чтобы gh release create смог создать
+# GitHub Release на этом репо. id-token не нужен — мы не публикуем
+# пакеты, не подписываем.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        # fetch-depth: 0 — нужен полный git history, чтобы
+        # --generate-notes корректно собрал changelog из PR'ов
+        # между предыдущим и текущим тегом.
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        # github.ref_name для push по тегу v0.1.0 = "v0.1.0".
+        # --generate-notes формирует notes из PR labels/merge commits.
+        # --repo здесь для явности: GITHUB_REPOSITORY уже указывает
+        # на mr-addams/arx-core, но явное лучше неявного.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --repo mr-addams/arx-core
