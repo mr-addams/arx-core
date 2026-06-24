@@ -1,0 +1,27 @@
+# ── Go build artefacts ──────────────────────────────────────────────────────
+# Стандартный набор для Go-модуля: собранные бинарники, test-бинарники,
+# coverage. /vendor/ НЕ добавляем — модуль использует go modules, не vendor.
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries (go test -c .../test)
+*.test
+
+# ── Coverage ─────────────────────────────────────────────────────────────────
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# ── Examples (локальная сборка примера не должна попадать в репо) ─────────────
+/examples/logaggregator/logaggregator
+
+# ── Release builds (на будущее, если добавим goreleaser / scripts/dist) ──────
+/dist/
+
+# ── OS cruft ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
