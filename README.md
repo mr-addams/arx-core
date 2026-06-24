@@ -4,50 +4,21 @@ The generic telemetry pipeline core extracted from ArxSentinel.
 
 ## Status
 
-Extracted-core stage. arx-core currently lives as a local Go module
-(`github.com/mr-addams/arx-core`) inside the arxsentinel monorepo and is
-resolved through the workspace's `go.work` file. Semantic versioning and
-publication as an independent repository are post-extraction decisions
-(see ADR-002 for the core/product boundary and Flow 082 for the
-documentation preparation work).
+Published library (extracted from ArxSentinel). arx-core is now a standalone
+public Go module (`github.com/mr-addams/arx-core`) — fully separated from the
+arxsentinel product layer. Domain-agnostic by design: implements a generic
+line-oriented telemetry pipeline (sources, processors, detectors, sinks,
+executors) with no built-in assumptions about the data domain. Product-specific
+logic — security scoring, threat intelligence, vendor integrations — lives in
+the arxsentinel product layer and consumes arx-core through the public runtime
+contract.
 
-arx-core is intentionally domain-agnostic: it implements a generic
-line-oriented telemetry pipeline (sources, processors, detectors,
-sinks, executors) with no built-in assumptions about the data domain.
-Product-specific logic — security scoring, threat intelligence, vendor
-integrations — lives in the arxsentinel product layer and consumes
-arx-core through the public runtime contract.
+## Installation
 
-## Quick start
-
-Inside the arxsentinel workspace, `go.work` already resolves the module.
-No additional setup is required:
+arx-core is a standard Go module. Add it to your project:
 
 ```bash
-go build ./...
-go test -race -count=1 ./...
-```
-
-As an external module consumer (forward-looking, once arx-core is
-extracted into its own repository), declare the dependency and a local
-`replace` directive pointing at a checkout:
-
-```go
-// go.mod
-module example.com/myconsumer
-
-go 1.26
-
-require github.com/mr-addams/arx-core v0.1.0
-
-replace github.com/mr-addams/arx-core => ../arx-core
-```
-
-The full build and race-test loop is identical to the workspace case:
-
-```bash
-go build ./...
-go test -race -count=1 ./...
+go get github.com/mr-addams/arx-core@v0.1.0
 ```
 
 ## Packages
