@@ -1,0 +1,149 @@
+# cookbook/rule-engine/syslog-anomaly.yaml
+#
+# Demonstrates a syslog anomaly-detection ruleset built on arx-core/pkg/rule. Combines
+# strongly-typed syslog.facility/severity (Int), syslog.message/program (String),
+# syslog.received_at (Timestamp) for time-windowed rules, a Map-typed syslog.labels
+# carrier (D11), and the implicit core.* envelope fields for cross-namespace gating.
+#
+# Critical reminder: the engine has NO rate() / windowed aggregation operator (D10).
+# "Anomaly" here is per-event pattern detection; stateful detection will be a
+# separate package in a future flow.
+#
+# References: pkg/rule/README.md, pkg/rule/REFERENCE.md, DECISIONS (D7, D11, D12, D14).
+---
+manifest:
+  plugin_id: syslog-anomaly
+  plugin_version: 0.1.0
+  role: processor
+  input_type: log
+  output_type: log
+  produces:
+    - { name: facility,     type: int,       required: true }
+    - { name: severity,     type: int,       required: true }
+    - { name: program,      type: string,    required: true }
+    - { name: message,      type: string,    required: true }
+    - { name: received_at,  type: timestamp, required: true }
+    - { name: host,         type: string,    required: true }
+    # Dynamic labels — declared once as a Map, accessed by key at eval time.
+    - { name: labels,       type: map,       required: false }
+  consumes:
+    - { name: stream,       type: string,    required: false }
+    - { name: source_type,  type: string,    required: false }
+---
+builder:
+  profile: syslog-anomaly
+  additional_profiles: []   # core is implicit; no other namespaces needed.
+  fields:
+    - { namespace: syslog, name: facility,    type: int }
+    - { namespace: syslog, name: severity,    type: int }
+    - { namespace: syslog, name: program,     type: string }
+    - { namespace: syslog, name: message,     type: string }
+    - { namespace: syslog, name: received_at, type: timestamp }
+    - { namespace: syslog, name: host,        type: string }
+    - { namespace: syslog, name: labels,      type: map }
+---
+# Rule expressions (each is a string passed to RuleSet.Add). Literal forms:
+#   ts"..."    KindTimestamp (RFC 3339)
+#   "..."      KindString
+#   3          KindInt (facility/severity codes — unsigned, D15)
+#   ts"..."    KindTimestamp
+#   (no ip literals — syslog payloads typically carry a string hostname, not a typed IP)
+rules:
+  # High-severity triage: severity 0..3 (Emergency, Alert, Critical, Error) on the
+  # syslog stream. `core.source_type` is a cross-namespace field — only available
+  # because "core" is implicit on every RuleSet.
+  - name: severity_high
+    expression: |
+      syslog.severity le 3 and core.source_type eq "syslog"
+    action_hint: enrich   # plugin enriches the event with severity label.
+
+  # Specific subsystem high-severity — kernel panic, OOM, auth failure.
+  - name: kernel_or_auth_panic
+    expression: |
+      syslog.program eq "kernel"
+      and syslog.severity le 1
+    action_hint: alert
+
+  # Login failure pattern — RE2 compiled at compile time, not per Eval.
+  - name: ssh_failed_password
+    expression: |
+      syslog.program eq "sshd"
+      and syslog.message matches "Failed password for (invalid user )?[a-zA-Z0-9_-]+"
+    action_hint: tag
+
+  # Service unavailable burst — string match + severity guard.
+  - name: service_unavailable_burst
+    expression: |
+      syslog.severity le 2
+      and syslog.message contains "503 Service Unavailable"
+    action_hint: alert
+
+  # Time-bounded rule — only flag messages received after a deployment timestamp.
+  # Demonstrates KindTimestamp comparison with a fixed wall-clock anchor.
+  - name: post_deploy_alerts
+    expression: |
+      syslog.received_at ge ts"2026-06-29T00:00:00Z"
+      and syslog.severity le 2
+    action_hint: tag
+
+  # Tenant filter via Map-typed labels (D11 — keys are runtime-resolved by design).
+  # A rule for the "prod" tenant; the labels["env"] key is NOT pre-declared in the
+  # Scheme, only the parent field `syslog.labels` of Kind Map.
+  - name: prod_tenant_errors
+    expression: |
+      syslog.labels["env"] eq "prod"
+      and syslog.severity le 3
+    action_hint: tag
+
+  # Glob over program names — useful when one logical service emits under N program
+  # names (e.g. nginx vs nginx-worker vs nginx-cache).
+  - name: nginx_family
+    expression: |
+      syslog.program wildcard "nginx*"
+    action_hint: pass
+
+  # Facility restriction — auth (facility 4) or security (13) or authpriv (10).
+  - name: auth_facility
+    expression: |
+      syslog.facility in [4, 10, 13]
+      and syslog.severity le 4
+    action_hint: tag
+---
+# FieldResolver contract sketch — Go pseudocode (D3: engine never reads Event.Payload).
+field_resolver:
+  type: syslogResolver
+  fields_owned: [syslog.*]
+  algorithm: |
+    type syslogResolver struct { facility, severity int; program, message, host string
+        received time.Time; labels map[string]rule.Value }
+    func (r syslogResolver) Resolve(field string, _ *plugin.Event) (rule.Value, bool) {
+        if !strings.HasPrefix(field, "syslog.") { return rule.Value{}, false }
+        switch strings.TrimPrefix(field, "syslog.") {
+        case "facility": return rule.NewInt(int64(r.facility)), true
+        case "severity": return rule.NewInt(int64(r.severity)), true
+        case "program":  return rule.NewString(r.program), true
+        case "message":  return rule.NewString(r.message), true
+        case "received_at": return rule.NewTimestamp(r.received), true
+        case "host":     return rule.NewString(r.host), true
+        case "labels":   return rule.NewMap(r.labels), true
+        }
+        return rule.Value{}, false
+    }
+---
+action_mapping:
+  alert:  [kernel_or_auth_panic, service_unavailable_burst]
+  tag:    [severity_high, ssh_failed_password, post_deploy_alerts, prod_tenant_errors, auth_facility]
+  enrich: []
+  pass:   [nginx_family]
+  contract: "engine verdict -> plugin action"
+---
+# Notes:
+# - This file deliberately does NOT use `rate()` or any windowed operator; that is the
+#   scope decision in D10. Per-event anomaly detection (the pattern-match kind) is
+#   the engine's natural workload; windowing will be a separate package later.
+# - `syslog.labels["env"]` is a Map field access — D11 makes key resolution a runtime
+#   concern of the resolver, not a compile-time field check.
+# - TS literals use RFC 3339 with timezone (Z or +HH:MM); ts"2026-06-29T00:00:00Z" is
+#   the canonical anchor for time-windowed rules.
+# - `nginx*` in a `wildcard` pattern matches any program starting with "nginx" (the
+#   matcher uses ? and * semantics, not shell regex).
