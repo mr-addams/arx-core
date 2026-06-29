@@ -218,13 +218,17 @@ type opLitBool struct {
 func (o *opLitBool) kind() opKind { return kLitBool }
 
 // opLitIP carries a KindIP Value plus the CIDR distinction. For non-CIDR, mask == 0
-// and the evaluator performs plain IP equality. For CIDR, mask is the prefix length
-// (0..32 for IPv4, 0..128 for IPv6) and the evaluator performs CIDR membership.
+// and ipnet is nil; the evaluator performs plain IP equality. For CIDR, mask is the
+// prefix length (0..32 for IPv4, 0..128 for IPv6) and ipnet is the *net.IPNet parsed
+// ONCE at compile time — the evaluator calls ipnet.Contains(left) directly with no
+// runtime ParseCIDR on the hot path (DECISION D17). Invariant: cidr==false ⇒ ipnet
+// nil; cidr==true ⇒ ipnet non-nil (compileLitIP populates it).
 type opLitIP struct {
-	pos  pos
-	v    rule.Value
-	cidr bool
-	mask int // 0 for plain IP, otherwise prefix length
+	pos   pos
+	v     rule.Value
+	cidr  bool
+	mask  int        // 0 for plain IP, otherwise prefix length
+	ipnet *net.IPNet // non-nil iff cidr==true; pre-resolved at compile time
 }
 
 func (o *opLitIP) kind() opKind { return kLitIP }
@@ -585,7 +589,8 @@ func posOf(n parser.Node) pos {
 
 // compileLitIP packages a parser LitIP into an opLitIP. The IsCIDR / mask pre-computation
 // lives here so the evaluator does not have to re-parse the IP / split the CIDR on the
-// hot path.
+// hot path. For CIDR literals the *net.IPNet is parsed ONCE here and stored on the op
+// (DECISION D17); eval calls ipnet.Contains(left) directly with no runtime ParseCIDR.
 func (c *Compiler) compileLitIP(nn *parser.LitIP) (op, *CompileError) {
 	if !nn.IsCIDR {
 		return &opLitIP{pos: posOf(nn), v: nn.Value, cidr: false, mask: 0}, nil
@@ -603,7 +608,7 @@ func (c *Compiler) compileLitIP(nn *parser.LitIP) (op, *CompileError) {
 		}
 	}
 	mask, _ := ipnet.Mask.Size()
-	return &opLitIP{pos: posOf(nn), v: nn.Value, cidr: true, mask: mask}, nil
+	return &opLitIP{pos: posOf(nn), v: nn.Value, cidr: true, mask: mask, ipnet: ipnet}, nil
 }
 
 // compileLitArray validates the array literal: every element must be a scalar literal.

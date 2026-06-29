@@ -57,7 +57,6 @@
 package compiler
 
 import (
-	"net"
 	"regexp"
 	"strings"
 
@@ -218,19 +217,20 @@ func evalCmp(n *opCmp, resolver rule.FieldResolver, event *plugin.Event) bool {
 
 	// Special case: IP `eq` / `ne` CIDR — if right is a CIDR literal, the
 	// comparison becomes IP-in-CIDR membership (left's IP against right's
-	// network). The compiler flags right opLitIP.cidr=true for this shape.
+	// network). The compiler pre-resolves the *net.IPNet at compile time
+	// (DECISION D17); eval just calls ipnet.Contains(left) — no ParseCIDR
+	// on the hot path.
 	if left.Kind() == rule.KindIP && right.Kind() == rule.KindIP {
 		if ipLit, ok := n.right.(*opLitIP); ok && ipLit.cidr {
 			leftIP, _ := left.AsIP()
-			ipNet := cidrNet(ipLit)
-			if ipNet == nil {
+			if ipLit.ipnet == nil {
 				return false
 			}
 			switch n.op {
 			case opCmpEq:
-				return ipNet.Contains(leftIP)
+				return ipLit.ipnet.Contains(leftIP)
 			case opCmpNe:
-				return !ipNet.Contains(leftIP)
+				return !ipLit.ipnet.Contains(leftIP)
 			default:
 				// Ordering comparisons against a CIDR are meaningless; the compiler
 				// only accepts eq / ne for IP-vs-CIDR, so reaching any other branch
@@ -261,24 +261,6 @@ func evalCmp(n *opCmp, resolver rule.FieldResolver, event *plugin.Event) bool {
 		return compareLess(right, left) || left.Equal(right)
 	}
 	return false
-}
-
-// cidrNet reconstructs the *net.IPNet for a CIDR-flavoured IP literal. The
-// literal stores the network address in .v and the prefix length in .mask.
-// Reconstructing the IPNet on every call is one ParseCIDR per call — small
-// enough for the IP-vs-CIDR eq/ne path, which is not the inner-loop hot path
-// (those plans are scalar, not IP-membership).
-func cidrNet(ipLit *opLitIP) *net.IPNet {
-	if ipLit == nil || !ipLit.cidr {
-		return nil
-	}
-	ipStr := ipLit.v.String()
-	cidrStr := ipStr + "/" + itoaPrefix(ipLit.mask)
-	_, ipnet, err := net.ParseCIDR(cidrStr)
-	if err != nil {
-		return nil
-	}
-	return ipnet
 }
 
 // compareLess reports whether left is strictly less than right under the natural
@@ -461,7 +443,9 @@ func compileWildcardPattern(pattern string) *regexp.Regexp {
 
 // evalIn implements `element in {set}`. The set must be a *opLitArray (the
 // compiler enforces this). For IP elements, set members that are CIDR literals
-// produce IP-in-CIDR membership rather than plain equality.
+// produce IP-in-CIDR membership rather than plain equality. The *net.IPNet for
+// each CIDR literal was pre-resolved at compile time (DECISION D17), so the
+// array branch uses ipnet.Contains directly with no runtime ParseCIDR.
 func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 	elem, eok := evalValue(n.element, resolver, event)
 	if !eok {
@@ -478,9 +462,10 @@ func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 		return false
 	}
 	// Iterate the set. For IP elements we dispatch per-member: plain IP uses
-	// Equal, CIDR uses membership. For non-IP elements every member must share
-	// the same Kind (the compiler enforces this); Kind-mismatch surfaces as
-	// "not this member", and if no member matches we return false.
+	// Equal, CIDR uses membership (via the pre-resolved *net.IPNet on the
+	// opLitIP). For non-IP elements every member must share the same Kind
+	// (the compiler enforces this); Kind-mismatch surfaces as "not this
+	// member", and if no member matches we return false.
 	switch elem.Kind() {
 	case rule.KindIP:
 		leftIP, _ := elem.AsIP()
@@ -489,18 +474,20 @@ func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 			if !ok {
 				continue
 			}
-			rightIP, _ := ipLit.v.AsIP()
+			// Branch on cidr first so we never call right.AsIP() on CIDR
+			// members — the CIDR branch uses ipnet.Contains(leftIP) and
+			// does not need the right-side IP at all. Hoisting the cidr
+			// check avoids one wasted defensive-copy per matched/missed
+			// CIDR member (the IP-vs-CIDR eval path is hot).
 			if ipLit.cidr {
-				// The literal's stored net.IP is the network address; we need
-				// the CIDR (network + mask) for Contains. The mask was captured
-				// at compile time; reconstruct the net.IPNet inline.
-				if ipInCIDR(leftIP, rightIP, ipLit.mask) {
+				if ipLit.ipnet != nil && ipLit.ipnet.Contains(leftIP) {
 					return true
 				}
-			} else {
-				if leftIP.Equal(rightIP) {
-					return true
-				}
+				continue
+			}
+			rightIP, _ := ipLit.v.AsIP()
+			if leftIP.Equal(rightIP) {
+				return true
 			}
 		}
 		return false
@@ -519,40 +506,6 @@ func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 		}
 		return false
 	}
-}
-
-// ipInCIDR reports whether left (a plain IP) is contained in the CIDR network
-// described by (network, prefix). prefix is the number of leading bits that
-// must match between left and network.
-//
-// We construct a net.IPNet on each call. This is technically a small allocation;
-// the hot path for IP `in` [CIDR] is rare enough (security policy filtering)
-// that we accept the cost in exchange for not threading a *net.IPNet through
-// the opLitIP struct (which would be a more invasive C1 contract change).
-func ipInCIDR(left, network net.IP, prefix int) bool {
-	if left == nil || network == nil {
-		return false
-	}
-	_, ipnet, err := net.ParseCIDR(network.String() + "/" + itoaPrefix(prefix))
-	if err != nil {
-		return false
-	}
-	return ipnet.Contains(left)
-}
-
-// itoaPrefix is a tiny strconv-free prefix-length formatter. The prefix is in
-// the range [0, 128], so the rendered string is at most 3 bytes.
-func itoaPrefix(p int) string {
-	if p < 0 || p > 128 {
-		return "0"
-	}
-	if p < 10 {
-		return string(rune('0' + p))
-	}
-	if p < 100 {
-		return string(rune('0'+p/10)) + string(rune('0'+p%10))
-	}
-	return "128"
 }
 
 // ========================== Function dispatch ===============================================
@@ -731,14 +684,6 @@ func evalValue(o op, resolver rule.FieldResolver, event *plugin.Event) (rule.Val
 	}
 	return rule.Value{}, false
 }
-
-// =========================================================================================
-//   Helpers for opLitIP pattern reconstruction
-// =========================================================================================
-
-// (kept minimal: cidrNet is the single helper used by evalCmp; ipInCIDR below
-//  uses itoaPrefix to format the prefix length without a strconv dependency on
-//  the hot path.)
 
 // compile-time conformance: Plan.Eval signature must stay stable for downstream
 // callers (the embedding plugin). The assignment below is a no-op at runtime;

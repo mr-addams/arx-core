@@ -275,6 +275,26 @@ func TestEval_TableDriven(t *testing.T) {
 		{"ip_in_plain_nomatch", `ip"8.8.8.8" in [ip"10.1.2.3", ip"10.1.2.4"]`, nil, nil, ev, false},
 		{"ip_in_mixed", `ip"10.1.2.3" in [ip"10.1.2.3", ip"192.168.0.0/16"]`, nil, nil, ev, true},
 
+		// ── IPv6 CIDR — Group G (D17). The itoaPrefix bug returned "128" for any
+		//    p ∈ [100, 128], corrupting every /100../127 IPv6 CIDR match. These
+		//    cases were silent on IPv4 (masks ≤ 32) and would have shipped as a
+		//    broken security-policy filter for IPv6 deployments. All cases
+		//    verified against net.ParseCIDR + net.IPNet.Contains.
+		{"ipv6_eq_cidr_slash64_match", `ip"2001:db8::1" eq ip"2001:db8::/64"`, nil, nil, ev, true},
+		{"ipv6_eq_cidr_slash64_nomatch", `ip"2001:db8:0:1::1" eq ip"2001:db8::/64"`, nil, nil, ev, false},
+		{"ipv6_eq_cidr_slash100_match", `ip"2001:db8::1" eq ip"2001:db8::/100"`, nil, nil, ev, true},
+		{"ipv6_eq_cidr_slash100_nomatch", `ip"2001:db8::ffff:ffff" eq ip"2001:db8::/100"`, nil, nil, ev, false},
+		{"ipv6_eq_cidr_slash127_match", `ip"2001:db8::1" eq ip"2001:db8::/127"`, nil, nil, ev, true},
+		{"ipv6_eq_cidr_slash127_nomatch", `ip"2001:db8::2" eq ip"2001:db8::/127"`, nil, nil, ev, false},
+		{"ipv6_eq_cidr_slash128_match", `ip"2001:db8::1" eq ip"2001:db8::1/128"`, nil, nil, ev, true},
+		{"ipv6_eq_cidr_slash128_nomatch", `ip"2001:db8::2" eq ip"2001:db8::1/128"`, nil, nil, ev, false},
+		{"ipv6_ne_cidr_slash100_match", `ip"2001:db8::ffff:ffff" ne ip"2001:db8::/100"`, nil, nil, ev, true},
+		{"ipv6_ne_cidr_slash100_nomatch", `ip"2001:db8::1" ne ip"2001:db8::/100"`, nil, nil, ev, false},
+		// Array form — IP `in` [CIDR...] where multiple elements may be CIDR.
+		{"ipv6_in_cidrs_match", `ip"2001:db8::1" in [ip"2001:db8::/64", ip"fe80::/10"]`, nil, nil, ev, true},
+		{"ipv6_in_cidrs_nomatch", `ip"::1" in [ip"2001:db8::/64", ip"fe80::/10"]`, nil, nil, ev, false},
+		{"ipv6_in_mixed_plain_and_cidr", `ip"2001:db8::1" in [ip"::1", ip"2001:db8::/64"]`, nil, nil, ev, true},
+
 		// ── String operators ──────────────────────────────────────────────────
 		{"contains_true", `http.uri contains "/api"`,
 			map[string]rule.Value{"http.uri": rule.NewString("/api/v1/users")}, nil, ev, true},
@@ -610,6 +630,68 @@ func BenchmarkEval_ComplexPlan(b *testing.B) {
 			"http.uri":    rule.NewString("/api/v1/items"),
 		},
 	}
+	ev := &plugin.Event{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.Eval(r, ev) {
+			b.Fatal("Eval returned false on positive case")
+		}
+	}
+}
+
+// BenchmarkEvalIPInCIDR measures the IP-in-CIDR eval path under DECISION D17.
+//
+// Before D17 this benchmark reported multiple allocs/op because the evaluator
+// called net.ParseCIDR on every Eval. Post-D17 the only remaining allocations
+// come from rule.Value.AsIP's documented defensive IP-slice copy — that copy
+// is a property of the pkg/rule Value API (types.go AsIP: "The copy is
+// intentional — callers may keep the slice without aliasing the engine's
+// storage") and is OUT OF SCOPE for D17.
+//
+// What D17 guarantees and this benchmark proves:
+//
+//   - the *net.IPNet is resolved ONCE at compile time (compileLitIP);
+//   - eval reads ipLit.ipnet.Contains(leftIP) directly;
+//   - no net.ParseCIDR appears on the eval hot path.
+//
+// The benchmark itself is the regression guard — if a future change re-introduces
+// ParseCIDR (or any other allocation specifically tied to IP-CIDR eval), the
+// alloc count here will rise above the baseline of 1 (AsIP copy) per Eval.
+//
+// Run with `go test -bench=BenchmarkEvalIPInCIDR -benchmem ./pkg/rule/compiler/`.
+func BenchmarkEvalIPInCIDR(b *testing.B) {
+	scheme := evalBenchScheme()
+	p := evalBenchCompile(b, `ip"10.1.2.3" eq ip"10.0.0.0/8"`, scheme)
+	r := &mapResolver{} // empty resolver — both sides are literals, no field lookup
+	ev := &plugin.Event{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.Eval(r, ev) {
+			b.Fatal("Eval returned false on positive case")
+		}
+	}
+}
+
+// BenchmarkEvalIPInCIDRArray exercises the `in` array form — per-element
+// ipnet.Contains against CIDR array members. Pre-D17 this path called
+// ipInCIDR per element (one ParseCIDR per CIDR member); post-D17 each CIDR
+// member's pre-resolved *net.IPNet is read directly. The alloc count on a
+// positive match is constant: 1 for elem.AsIP() on the resolver-supplied
+// element, and 0 for the matched array member because the evalIn IP
+// branch short-circuits on cidr first and never computes rightIP for CIDR
+// members. A no-match run burns len(array) AsIP copies (left + each
+// non-CIDR member; CIDR members still short-circuit past AsIP), but the
+// ParseCIDR-per-element cost is gone.
+func BenchmarkEvalIPInCIDRArray(b *testing.B) {
+	scheme := evalBenchScheme()
+	p := evalBenchCompile(b,
+		`ip"10.1.2.3" in [ip"10.0.0.0/8", ip"172.16.0.0/12", ip"192.168.0.0/16"]`,
+		scheme)
+	r := &mapResolver{}
 	ev := &plugin.Event{}
 
 	b.ReportAllocs()
