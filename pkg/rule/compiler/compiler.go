@@ -62,6 +62,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sync"
 
 	"github.com/mr-addams/arx-core/pkg/rule"
 	"github.com/mr-addams/arx-core/pkg/rule/parser"
@@ -378,6 +379,18 @@ type opWildcard struct {
 	pos     pos
 	left    op
 	pattern string // pre-validated literal string
+
+	// Изменение (Задача C2, evaluator): ленивая компиляция wildcard-паттерна в
+	// *regexp.Regexp. Компилятор (C1) НЕ компилирует regexp на этом этапе —
+	// compileWildcard остаётся без изменений (pattern валидируется как строка,
+	// не как regex). Эвалюатор компилирует паттерн при первом Eval через
+	// compileOnce, чтобы не платить за regexp.Compile на каждом Eval-вызове и
+	// при этом не делать compile-time compile (что потребовало бы расширения
+	// contract-стабильного C1 — sync.Once здесь держит compiler.go неизменным
+	// по поведению). Два новых поля additive: opWildcard неэкспортирован,
+	// публичный API не затронут.
+	regex       *regexp.Regexp
+	compileOnce sync.Once
 }
 
 func (o *opWildcard) kind() opKind { return kWildcard }
