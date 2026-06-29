@@ -1,0 +1,145 @@
+# cookbook/rule-engine/rate-profile.yaml
+#
+# "Rate-profile" for the arx-core/pkg/rule engine: detection rules that LOOK like rate-
+# based gating (latency thresholds, burst flags, retry-count caps) WITHOUT using any
+# stateful operator. The engine has NO rate() / count_in_window() / stateful operator
+# (DECISION D10) — the cookbook must not invent operators. Instead, the embedding plugin
+# pre-computes rate-like summaries on its side and exposes them as engine fields. For
+# example: custom.errors_in_bucket, custom.window_ms, custom.bucket_id. The rule below
+# matches "high error rate in the current 1-minute bucket" — detection is done outside
+# the engine, the predicate here just decides pass/drop. State belongs to the plugin (D10).
+#
+# References: pkg/rule/README.md, pkg/rule/REFERENCE.md, DECISIONS D10, D11, D14.
+---
+manifest:
+  plugin_id: rate-profile
+  plugin_version: 0.1.0
+  role: processor
+  input_type: log
+  output_type: log
+  produces:
+    # Integer counter exposed from the plugin's aggregator.
+    - { name: errors_in_bucket, type: int,      required: true }
+    # Width of the rolling time window (ms) that produced the counter.
+    - { name: window_ms,        type: int,      required: true }
+    # String bucket identifier — useful for grouping / debugging.
+    - { name: bucket_id,        type: string,   required: true }
+    # Last event's measured latency.
+    - { name: latency_ms,       type: int,      required: false }
+    # Status code carried by the event (HTTP or generic).
+    - { name: last_status,      type: int,      required: false }
+    # Dynamic per-event attributes (tenant, request_id, etc.).
+    - { name: attrs,            type: map,       required: false }
+  consumes:
+    - { name: stream,           type: string,   required: false }
+    - { name: level,            type: string,   required: false }
+    - { name: source_type,      type: string,   required: false }
+---
+builder:
+  profile: rate-profile
+  additional_profiles: []
+  fields:
+    - { namespace: custom, name: errors_in_bucket, type: int }
+    - { namespace: custom, name: window_ms,        type: int }
+    - { namespace: custom, name: bucket_id,        type: string }
+    - { namespace: custom, name: latency_ms,       type: int }
+    - { namespace: custom, name: last_status,      type: int }
+    - { namespace: custom, name: attrs,            type: map }
+---
+# Rule expressions. Each one decides an action based on plugin-side pre-computed fields
+# plus the implicit envelope. NO rate() operator — see top-of-file note.
+rules:
+  # High error rate in a 1-minute bucket AND a non-5xx event landed here.
+  # Detection logic in the plugin supplies errors_in_bucket; this rule just gates.
+  - name: high_error_rate_drop
+    expression: |
+      custom.errors_in_bucket ge 50
+      and custom.window_ms eq 60000
+    action_hint: drop
+
+  # Latency SLO breach — p99-style single-event threshold. No window needed because
+  # the plugin already smoothed; the engine just compares.
+  - name: latency_slo_breach
+    expression: |
+      custom.latency_ms ge 750
+      and core.source_type eq "http"
+    action_hint: tag
+
+  # Retry storm on a specific tenant — Map access to a dynamic key. The tenant_id
+  # key is NOT validated at compile time (D11 — runtime resolution by the resolver).
+  - name: tenant_retry_storm
+    expression: |
+      custom.attrs["retry_count"] ge 3
+      and core.level eq "error"
+    action_hint: drop
+
+  # 5xx burst in current bucket.
+  - name: status_5xx_burst
+    expression: |
+      custom.last_status in [500, 502, 503, 504]
+      and custom.errors_in_bucket ge 10
+    action_hint: alert
+
+  # Bucket-bound stability check — bucket_id in a known healthy set ensures only
+  # well-instrumented buckets can fire the alert (avoids noise from empty buckets).
+  - name: stable_bucket_alert
+    expression: |
+      custom.bucket_id in ["prod-web-1", "prod-web-2", "prod-api-1"]
+      and custom.errors_in_bucket ge 100
+    action_hint: alert
+
+  # Conservative fallback — flag anything error-level on the main stream.
+  - name: main_stream_error_any
+    expression: |
+      core.stream eq "main"
+      and core.level eq "error"
+    action_hint: tag
+
+  # Wildcard — bucket_id matches the "prod-" family prefix.
+  - name: prod_family_only
+    expression: |
+      custom.bucket_id wildcard "prod-*"
+    action_hint: pass
+---
+# FieldResolver contract sketch.
+field_resolver:
+  type: rateProfileResolver
+  fields_owned: [custom.*]
+  algorithm: |
+    // Plugin-side struct: values are computed by the plugin's own aggregator;
+    // they are NOT computed by the rule engine (D10).
+    type rateProfileResolver struct {
+        errors int64
+        windowMs int64
+        bucketID, lastStatus int64
+        bucketName string
+        attrs map[string]rule.Value
+    }
+    func (r rateProfileResolver) Resolve(field string, _ *plugin.Event) (rule.Value, bool) {
+        if !strings.HasPrefix(field, "custom.") { return rule.Value{}, false }
+        switch strings.TrimPrefix(field, "custom.") {
+        case "errors_in_bucket": return rule.NewInt(r.errors), true
+        case "window_ms":        return rule.NewInt(r.windowMs), true
+        case "bucket_id":        return rule.NewString(r.bucketName), true
+        case "latency_ms":       return rule.NewInt(r.lastStatus), true   // simplified
+        case "last_status":      return rule.NewInt(r.lastStatus), true
+        case "attrs":            return rule.NewMap(r.attrs), true
+        }
+        return rule.Value{}, false
+    }
+---
+action_mapping:
+  drop:  [high_error_rate_drop, tenant_retry_storm]
+  alert: [status_5xx_burst, stable_bucket_alert]
+  tag:   [latency_slo_breach, main_stream_error_any]
+  pass:  [prod_family_only]
+  contract: "plugin-supplied counters + engine verdict -> action"
+---
+# Notes:
+# - The "rate" here is the PLUGIN's word, not an engine operator. The engine only sees
+#   scalars already smoothed by the plugin (D10). Cross-event state and time-window
+#   arithmetic live entirely in plugin code.
+# - `custom.attrs["retry_count"]` is a runtime-resolved Map access — the key
+#   `retry_count` is not pre-declared in the Scheme; D11 keeps Map keys at eval time.
+# - `custom.window_ms eq 60000` is exact-match against the bucket size — useful to
+#   rule out partial-window values if the plugin exposes rolling sub-buckets.

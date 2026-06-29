@@ -1,0 +1,130 @@
+# cookbook/rule-engine/waf-http.yaml
+#
+# Demonstrates the arx-core/pkg/rule engine from a LIBRARY-EMBEDDER's view (DECISION D17):
+# a WAF-style plugin declares its http.* namespace in the Manifest, registers the fields
+# into the shared Catalog, and compiles a small rule set against the resulting Scheme.
+# The action side (pass / drop / tag) is the embedding plugin's responsibility — the
+# engine returns a predicate verdict only (DECISION D12).
+#
+# References:
+#   pkg/rule/README.md         — concept, architecture, FieldResolver contract
+#   pkg/rule/REFERENCE.md      — operator / literal grammar (the exact rules used here)
+#   .opencode/flows/001_2026-06-25_universal-rule-engine/DECISIONS.md (D7, D8, D11, D14, D15)
+---
+# Manifest: fields this plugin produces. FieldDecl.Type opts the field into the rule
+# engine — leaving Type empty makes it invisible to Schemes. Each Name spelling becomes
+# the second segment of <namespace>.<name>.
+manifest:
+  plugin_id: waf-http
+  plugin_version: 0.1.0
+  role: processor
+  input_type: log
+  output_type: log
+  produces:
+    - { name: uri.path,   type: string, required: true }
+    - { name: method,     type: string, required: true }
+    - { name: status,     type: int,    required: true }
+    - { name: user_agent, type: string, required: false }
+    - { name: client_ip,  type: ip,     required: true }
+    - { name: attrs,      type: map,    required: false }
+---
+# Catalog + Scheme assembly via Builder. The "core" namespace (Envelope fields:
+# timestamp, stream, source, source_type, level) is implicit on every RuleSet.
+# Profiles() may add cross-namespace visibility (not needed here — single namespace).
+builder:
+  profile: waf-http
+  additional_profiles: []
+  fields:
+    - { namespace: http, name: uri.path,   type: string }
+    - { namespace: http, name: method,     type: string }
+    - { namespace: http, name: status,     type: int }
+    - { namespace: http, name: user_agent, type: string }
+    - { namespace: http, name: client_ip,  type: ip }
+    - { namespace: http, name: attrs,      type: map }
+---
+# Rule expressions passed to RuleSet.Add(name, expr). Order is significant: Match walks
+# left-to-right and returns the FIRST predicate that evaluates to true (D12 — first-match-
+# wins). Literal forms used: "..." (string), 200 (unsigned int, D15), ip"..." (IP/CIDR),
+# [...] (array for `in`), "/" / "*" (wildcard pattern, ?/* grammar).
+rules:
+  - name: probe_block
+    expression: |
+      http.uri.path contains "/.env"
+      or http.uri.path contains "/wp-admin"
+      or http.uri.path contains "/phpmyadmin"
+    action_hint: drop
+
+  - name: admin_internal_only
+    expression: |
+      http.uri.path starts_with "/admin"
+      and not (
+        http.client_ip in [ip"10.0.0.0/8", ip"172.16.0.0/12", ip"192.168.0.0/16"]
+      )
+    action_hint: drop
+
+  - name: status_403_non_browser
+    expression: |
+      http.status eq 403
+      and not http.user_agent contains "Mozilla"
+    action_hint: tag
+
+  - name: status_4xx
+    expression: |
+      http.status in [400, 401, 403, 404, 405, 410]
+    action_hint: tag
+
+  - name: curl_ua
+    expression: |
+      http.user_agent matches "^curl/[0-9]+\\.[0-9]+"
+    action_hint: pass
+
+  - name: api_path_any_version
+    expression: |
+      http.uri.path wildcard "/api/*/users"
+    action_hint: tag
+---
+# FieldResolver contract (Go pseudocode — not a runnable binary). The engine never
+# reads Event.Payload (D3). This struct is what the plugin implements to expose http.*
+# values to the compiled Plan on each Match call.
+field_resolver:
+  type: httpResolver
+  fields_owned: [http.*]
+  algorithm: |
+    type httpResolver struct {
+        method, path, ua string
+        status           int
+        client           net.IP
+        attrs            map[string]rule.Value
+    }
+    func (r httpResolver) Resolve(field string, _ *plugin.Event) (rule.Value, bool) {
+        // Fast reject: not our namespace — let dispatch fall through to core.* etc.
+        if !strings.HasPrefix(field, "http.") {
+            return rule.Value{}, false
+        }
+        switch strings.TrimPrefix(field, "http.") {
+        case "uri.path":   return rule.NewString(r.path), true
+        case "method":     return rule.NewString(r.method), true
+        case "status":     return rule.NewInt(int64(r.status)), true
+        case "user_agent": return rule.NewString(r.ua), true
+        case "client_ip":  return rule.NewIP(r.client), true
+        case "attrs":      return rule.NewMap(r.attrs), true
+        }
+        return rule.Value{}, false
+    }
+---
+# Action mapping is the plugin's job (D12). The engine returns (ruleName, matched bool)
+# from Match; the plugin turns the matched-name into an action vocabulary of its own.
+action_mapping:
+  drop: [probe_block, admin_internal_only]
+  tag:  [status_403_non_browser, status_4xx, api_path_any_version]
+  pass: [curl_ua]
+  contract: "engine returns (string, bool); plugin owns the action vocabulary"
+---
+# Notes:
+# - No rate() or windowed operator — DECISION D10 keeps rate-limiting OUT of v1.
+# - Map access attrs["..."] is runtime-resolved (D11): keys are NOT validated at compile
+#   time by design; the resolver decides what an unknown key means.
+# - `not (ip in [...])` requires parentheses — `not` binds tighter than `and`
+#   (REFERENCE §"Precedence and associativity").
+# - Numeric literals here are intentionally unsigned (D15). The future extension path
+#   for signed numbers is sketched in REFERENCE.md under v1 non-goals.

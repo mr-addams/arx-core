@@ -1,0 +1,160 @@
+# cookbook/rule-engine/custom-plugin.yaml
+#
+# Generic tutorial for embedding arx-core/pkg/rule into a NEW plugin (DECISION D17).
+# Pipeline view: Manifest declares -> Catalog is seeded -> Builder projects a Scheme
+# -> Compiler checks the expressions -> Plan is held inside RuleSet -> Match returns a
+# verdict -> the plugin chooses an action (D12).
+#
+# This file is a recipe in five steps; each step shows what the embedding plugin author
+# writes in Go. The plugin namespace used here is "demo" — replace it with the real
+# plugin_id once the namespace is fixed.
+#
+# References:
+#   pkg/rule/README.md         — architecture overview (read first)
+#   pkg/rule/REFERENCE.md      — operator / literal grammar (use while authoring rules)
+#   pkg/plugin/manifest.go     — FieldDecl.Type extension point (D8)
+#   DECISIONS D3 (FieldResolver), D8.1 (FieldType), D9 (Profiles), D12 (action)
+---
+# ---------- STEP 1 — DECLARE FIELDS IN THE MANIFEST ----------
+# FieldDecl.Type is the opt-in flag for the rule engine (D8). Leaving Type empty
+# keeps the field invisible to Schemes (back-compat). The namespace is the plugin_id.
+manifest:
+  plugin_id: demo
+  plugin_version: 0.1.0
+  role: processor
+  input_type: event
+  output_type: event
+  produces:
+    - { name: tenant_id,     type: string, required: true }
+    - { name: request_count, type: int,    required: true }
+    - { name: latency_ms,    type: int,    required: false }
+    - { name: error_code,    type: int,    required: false }
+    - { name: region,        type: string, required: false }
+    - { name: tags,          type: map,    required: false }
+---
+# ---------- STEP 2 — BUILD CATALOG + SCHEME VIA BUILDER ----------
+# Builder is the ergonomic façade. It hides Catalog.Register / Scheme.Project /
+# compiler.NewCompiler and returns a ready-to-use *ruleset.RuleSet. Every RuleSet
+# implicitly includes the "core" namespace (Envelope fields).
+builder:
+  profile: demo
+  additional_profiles: []
+  fields:
+    - { namespace: demo, name: tenant_id,     type: string }
+    - { namespace: demo, name: request_count, type: int }
+    - { namespace: demo, name: latency_ms,    type: int }
+    - { namespace: demo, name: error_code,    type: int }
+    - { namespace: demo, name: region,        type: string }
+    - { namespace: demo, name: tags,          type: map }
+---
+# ---------- STEP 3 — SHIP A FIELDRESOLVER ----------
+# The resolver is the only contract plugin-side code crosses to reach the engine (D3).
+# It MUST NOT read Event.Payload (payload opacity is by convention). It MUST return
+# (rule.Value{}, false) for unknown / mismatched / absent fields.
+field_resolver:
+  type: demoResolver
+  fields_owned: [demo.*]
+  algorithm: |
+    type demoResolver struct {
+        tenantID string; reqCount, latencyMs, errCode int64
+        region string; tags map[string]rule.Value
+    }
+    func (r demoResolver) Resolve(field string, _ *plugin.Event) (rule.Value, bool) {
+        if !strings.HasPrefix(field, "demo.") { return rule.Value{}, false }
+        switch strings.TrimPrefix(field, "demo.") {
+        case "tenant_id":     return rule.NewString(r.tenantID), true
+        case "request_count": return rule.NewInt(r.reqCount), true
+        case "latency_ms":    return rule.NewInt(r.latencyMs), true
+        case "error_code":    return rule.NewInt(r.errCode), true
+        case "region":        return rule.NewString(r.region), true
+        case "tags":          return rule.NewMap(r.tags), true
+        }
+        return rule.Value{}, false
+    }
+---
+# ---------- STEP 4 — COMPILE RULES INTO A RULESET ----------
+# RuleSet compiles each expression under a write lock; Match evaluates against an
+# immutable Plan under a read lock. Compile errors fail at Add time, not at traffic
+# time — a misconfiguration surfaces at startup (D13).
+ruleset_lifecycle:
+  build: |
+    rs, err := builder.New("demo").
+        Field("demo", "tenant_id",     rule.TypeString).
+        Field("demo", "request_count", rule.TypeInt).
+        Field("demo", "latency_ms",    rule.TypeInt).
+        Field("demo", "error_code",    rule.TypeInt).
+        Field("demo", "region",        rule.TypeString).
+        Field("demo", "tags",          rule.TypeMap).
+        CompileRules(map[string]string{
+            "high_traffic_tenant":  `demo.tenant_id eq "acme" and demo.request_count gt 100`,
+            "slow_request":         `demo.latency_ms ge 500`,
+            "client_error_4xx":     `demo.error_code ge 400 and demo.error_code lt 500`,
+            "prod_region_warning":  `demo.region eq "us-east-1" and demo.error_code ge 500`,
+            "tagged_request_alert": `demo.tags["source"] eq "partner-api"`,
+        })
+    if err != nil { return fmt.Errorf("compile rules: %w", err) }
+
+  match_per_event: |
+    name, matched := rs.Match(event, demoResolver{
+        tenantID:  payload.TenantID, reqCount: payload.RequestCount,
+        latencyMs: payload.LatencyMs, errCode: int64(payload.ErrorCode),
+        region: payload.Region, tags: payload.Tags,
+    })
+    if !matched { return event, nil }  // no rule fired — pass-through
+
+  runtime_mutation: |
+    if err := rs.Replace("slow_request", `demo.latency_ms ge 750`); err != nil {
+        log.Printf("rule replace failed: %v", err)  // old rule keeps firing
+    }
+    rs.Remove("prod_region_warning")
+    _ = rs.Add("new_emergency_drop", `demo.error_code eq 503`)
+
+  introspection: |
+    fmt.Println(rs.Rules()) // [{Name, Expression}, ...]
+    fmt.Println(rs.Stats()) // map[rule_name]match_count, monotonic since Add
+---
+# ---------- STEP 5 — RULE EXAMPLES ----------
+# Each rule here compiles against the demo.* namespace. Order matters: Match returns
+# the first predicate that evaluates to true (D12 — first-match-wins).
+rules:
+  - name: high_traffic_tenant
+    expression: 'demo.tenant_id eq "acme" and demo.request_count gt 100'
+    action_hint: tag
+
+  - name: slow_request
+    expression: 'demo.latency_ms ge 500'
+    action_hint: tag
+
+  - name: client_error_4xx
+    expression: 'demo.error_code ge 400 and demo.error_code lt 500'
+    action_hint: tag
+
+  - name: prod_region_warning
+    expression: 'demo.region eq "us-east-1" and demo.error_code ge 500'
+    action_hint: alert
+
+  - name: tagged_request_alert
+    expression: 'demo.tags["source"] eq "partner-api"'
+    action_hint: alert
+
+  - name: burst_threshold
+    expression: 'demo.request_count gt 1000'
+    action_hint: drop
+---
+# Action mapping is the plugin's job (D12). The engine returns (ruleName, matched);
+# the plugin owns the action vocabulary (pass / drop / tag / alert / enrich).
+action_mapping:
+  drop:  [burst_threshold]
+  alert: [prod_region_warning, tagged_request_alert]
+  tag:   [high_traffic_tenant, slow_request, client_error_4xx]
+  contract: "engine returns (ruleName, matched); plugin decides pass / drop / tag / alert"
+---
+# ---------- RECAP ----------
+# Embedding the engine: Manifest fields → Builder → FieldResolver (own one namespace;
+# never read Event.Payload) → Match → action mapping → runtime Replace/Add/Remove,
+# Rules()/Stats() for ops views.
+#
+# Out of scope (intentionally NOT here):
+#   - rate(), count_in_window(), since_last()    (D10, future package)
+#   - negative numeric literals (-42)            (D15, future lexer extension)
+#   - user-callable functions (lower, upper, ...) (D14, future function table)
