@@ -5,15 +5,53 @@
 
 package plugin
 
+// ========================== FieldType — field contract mirror of Kind =======================
+
+// FieldType is the stable, version-independent name of a field's value kind carried by
+// FieldDecl (DECISION D8). It mirrors the Value Kind enum (DECISION D5) as a string
+// constant so the field contract — what a Manifest and the rule-language type-checker
+// exchange — stays textual rather than dependent on the underlying numeric Kind values.
+//
+// FieldType is owned by pkg/plugin (DECISION D8.1): the canonical definition lives here
+// next to FieldDecl so that pkg/plugin does NOT need to import pkg/rule (which would
+// create a new dep-graph edge the Core author deliberately avoided). pkg/rule re-exports
+// FieldType as a type alias (rule.FieldType = plugin.FieldType) so existing callers of
+// pkg/rule — the compiler, the parser, the evaluator, and tests — keep compiling
+// unchanged.
+//
+// KindInvalid (the "absent field" sentinel) is intentionally NOT represented: it is a
+// runtime sentinel, not a declared field type. A future Kind added without a corresponding
+// FieldType constant will be rejected by pkg/rule.Catalog.Register with ErrUnknownFieldType.
+type FieldType string
+
+// Field type constants. The string value is part of the engine's diagnostic surface
+// (rule-language type names, error messages, Manifest exports) — treat changes as
+// breaking.
+const (
+	TypeString    FieldType = "string"
+	TypeInt       FieldType = "int"
+	TypeFloat     FieldType = "float"
+	TypeBool      FieldType = "bool"
+	TypeIP        FieldType = "ip"
+	TypeBytes     FieldType = "bytes"
+	TypeTimestamp FieldType = "timestamp"
+	TypeDuration  FieldType = "duration"
+	TypeArray     FieldType = "array"
+	TypeMap       FieldType = "map"
+)
+
+// ========================== FieldDecl — single field declaration ===========================
+
 // FieldDecl declares a single named field that a plugin either produces
 // (emits in its output payloads) or consumes (requires in its input payloads).
 //
 // RESOLVED-Q4a (Flow 083) fixes the minimum viable shape: a Name plus a
-// Required flag. The Type field is intentionally absent — it can be added in
-// a later phase if the field-level validator ever needs to reason about field
-// types beyond name-presence checks. Keeping the shape minimal preserves
-// back-compat with existing plugins and avoids dragging in reflection-based
-// schemas.
+// Required flag. The Type field was intentionally absent at first — it is added
+// in Flow 001 (DECISION D8) as the forward-compatible extension point the Core
+// author left in FieldDecl for exactly this purpose (a new field with a string-typed
+// zero value is backward-compatible at both the Go ABI level and the API level: every
+// existing FieldDecl literal keeps compiling, and plugins that have not opted into
+// the rule engine continue to work via the Name/Required-only contract).
 //
 // A plugin that leaves Produces and Consumes nil declares "no field contract"
 // — the pipeline bootstrapper treats it as compatible with any field shape.
@@ -31,6 +69,18 @@ type FieldDecl struct {
 	// the mismatch before any data flows. Optional fields (Required == false)
 	// are still listed in Consumes so consumers can use them when present.
 	Required bool
+
+	// Type carries the field's FieldType (DECISION D8) — the type this field holds at
+	// evaluation time, mirroring the Value Kind enum (D5). The zero value (empty string)
+	// means "untyped / legacy field": the field-level validator continues to work on
+	// Name/Required alone, and the rule engine treats the field as invisible to Schemes
+	// (a Schemes-only-aware plugin must explicitly set Type to opt into rule-engine
+	// registration). This preserves back-compat with every existing FieldDecl user.
+	//
+	// Adding this field is the forward-compatible extension point the Core author left
+	// in FieldDecl for exactly this purpose (see the original RESOLVED-Q4a / Flow 083
+	// comment above).
+	Type FieldType
 }
 
 // Manifest describes a plugin's identity and data contract.
