@@ -266,6 +266,33 @@ func New(catalog *rule.Catalog, profile string) (*RuleSet, error) {
 	}, nil
 }
 
+// NewWithCompiler constructs a RuleSet from an already-projected Scheme and a
+// pre-built Compiler. It is the path used by Builder when it wants to control
+// exactly which namespaces participate in the Scheme (e.g. extra profiles)
+// without changing the public New contract.
+//
+// All arguments must be non-nil and mutually consistent: scheme must be a
+// projection of catalog, and compiler must have been built from that scheme.
+// Passing mismatched values does not panic, but Add / Match will behave as the
+// provided objects dictate.
+func NewWithCompiler(catalog *rule.Catalog, scheme *rule.Scheme, c *compiler.Compiler, profile string) (*RuleSet, error) {
+	if catalog == nil {
+		return nil, errors.New("rule: NewWithCompiler requires a non-nil catalog")
+	}
+	if scheme == nil {
+		return nil, errors.New("rule: NewWithCompiler requires a non-nil scheme")
+	}
+	if c == nil {
+		return nil, errors.New("rule: NewWithCompiler requires a non-nil compiler")
+	}
+	return &RuleSet{
+		catalog:  catalog,
+		scheme:   scheme,
+		compiler: c,
+		profile:  profile,
+	}, nil
+}
+
 // ========================== compileExpr — internal locked helper ================================
 
 // compileExpr runs the lex → parse → compile pipeline on expression and returns a
