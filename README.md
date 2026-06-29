@@ -1,17 +1,27 @@
 # arx-core
 
-The generic telemetry pipeline core extracted from ArxSentinel.
+A universal, domain-agnostic core for telemetry processing — the building
+block for distributed telemetry collection and processing networks.
 
 ## Status
 
-Published library (extracted from ArxSentinel). arx-core is now a standalone
-public Go module (`github.com/mr-addams/arx-core`) — fully separated from the
-arxsentinel product layer. Domain-agnostic by design: implements a generic
-line-oriented telemetry pipeline (sources, processors, detectors, sinks,
-executors) with no built-in assumptions about the data domain. Product-specific
-logic — security scoring, threat intelligence, vendor integrations — lives in
-the arxsentinel product layer and consumes arx-core through the public runtime
-contract.
+Published library. arx-core is a standalone public Go module
+(`github.com/mr-addams/arx-core`) — a universal core for telemetry
+processing. It implements a composable streaming pipeline — sources,
+processors, detectors, sinks, executors — with no built-in assumptions about
+the data domain, the wire protocol, or the payload schema.
+
+The design goal is broad protocol coverage: arx-core is being equipped with
+the widest practical set of source/sink/processor plugins so that a single
+node can speak the major standard telemetry protocols. Each node is a
+self-contained building block — composing many of them is what makes it
+possible to build distributed telemetry collection and processing networks.
+
+arx-core originated as the pipeline core of ArxSentinel and was extracted into
+a standalone module. ArxSentinel is now simply its first consumer: product-
+specific logic — security scoring, threat intelligence, vendor integrations —
+lives in that product layer and reaches arx-core only through the public
+runtime contract. Nothing in the core is tied to that origin.
 
 ## Installation
 
@@ -73,13 +83,13 @@ later flow phase).
 
 ## Boundary rules
 
-Files inside `arx-core/` must not import anything from the upper
-arxsentinel product layer (`pkg/`, `internal/` of the parent repository).
-The dependency direction is strictly `arxsentinel → arx-core`, never the
-other way around. This boundary is enforced by ADR-002 and is what
-keeps arx-core publishable as a standalone library. Product-specific
-packages — vendor integrations, security scoring, deploy tooling — live
-in the product layer and consume arx-core through its public runtime
+The dependency direction is strictly one-way: consumers depend on arx-core,
+never the reverse. Files inside `arx-core/` must not import anything from a
+consuming product layer — for the reference consumer, ArxSentinel, that means
+its `pkg/` and `internal/` are off-limits. This boundary is enforced by ADR-002
+and is what keeps arx-core publishable as a standalone, reusable core.
+Product-specific packages — vendor integrations, scoring, deploy tooling —
+live in the consumer and reach arx-core only through its public runtime
 contract.
 
 ## License
