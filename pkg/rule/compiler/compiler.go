@@ -35,10 +35,10 @@
 //       package). The compiler produces the typed plan; the evaluator executes it.
 //     - Implicit type coercion (DECISION D14 / D15): v1 is strict-typed. The only
 //       special case is IP `eq` CIDR / IP `in` [CIDR...] on the right operand.
-//     - Function implementations (DECISION D14): v1 has a closed, EMPTY function
-//       table. Every FuncCall is rejected with `unknown_function`. The function
-//       registry is wired up (so future flows can add entries by listing them in
-//       one place) but no entry exists in v1.
+//     - Function implementations (DECISION D16): the v0.3.0 function table is
+//       a closed, package-internal registry (functions.go); compile-time signature
+//       checking rejects unknown names, wrong arity, and per-argument Kind
+//       mismatches before eval is reached.
 //     - Parser / lexer (Group B). The compiler consumes parser.Node values only.
 //     - Map-key validation (DECISION D11). Map keys are eval-time resolved.
 //
@@ -288,13 +288,16 @@ type opBracket struct {
 
 func (o *opBracket) kind() opKind { return kBracket }
 
-// opFunc is a function call. v1 has a closed EMPTY function table; every FuncCall
-// is rejected with CodeUnknownFunction. The struct is here so the evaluator's
-// future dispatch has a stable shape.
+// opFunc is a function call. The compiled op carries the function name, the
+// compiled argument ops, and the FuncSpec resolved at compile time (DECISION
+// D16 §2 — compile-time signature checking). The evaluator dispatches via
+// spec.Eval directly; it does not re-look-up the name or re-validate the
+// arity / argument Kinds.
 type opFunc struct {
 	pos  pos
 	name string
 	args []op
+	spec FuncSpec
 }
 
 func (o *opFunc) kind() opKind { return kFunc }
@@ -696,27 +699,65 @@ func (c *Compiler) compileBracketAccess(nn *parser.BracketAccess) (op, *CompileE
 
 // ========================== Function calls ==================================================
 
-// compileFuncCall is the v1 stub. The function table is closed AND EMPTY (D14), so
-// every FuncCall is rejected with CodeUnknownFunction. The branch is here so a future
-// flow can populate the table by adding a single case statement — no further changes
-// to compileFuncCall's signature are required.
+// compileFuncCall resolves the function name against the registry, validates the
+// argument count and per-argument Kind against the registered FuncSpec, and emits an
+// opFunc carrying the resolved spec (DECISION D16 §2 — compile-time signature
+// checking).
+//
+// Errors:
+//   - CodeUnknownFunction: name is not in the registry.
+//   - CodeBadFuncArity: argument count does not match ParamKinds.
+//   - CodeBadFuncArgType: per-argument Kind does not match the declared ParamKinds.
+//
+// Note: a parameter declared as KindInvalid in the registry (e.g. to_string's
+// single "any" parameter) accepts any argument Kind. This is how to_string is
+// polymorphic without special-casing the compiler's per-argument check.
+//
+// The resolved spec is stored on the opFunc so the evaluator dispatches directly
+// to spec.Eval without re-looking-up the name or re-validating the signature.
 func (c *Compiler) compileFuncCall(nn *parser.FuncCall) (op, *CompileError) {
-	// Compile args eagerly so a bad type in the argument list surfaces here, not in
-	// some downstream op dispatch.
+	// Resolve the function name in the registry first — a bad name is the most
+	// common error and short-circuits arg compilation (no point validating args
+	// for a function that doesn't exist).
+	spec, ok := Lookup(nn.Name)
+	if !ok {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeUnknownFunction,
+			Message: fmt.Sprintf("function %q is not in the function table", nn.Name),
+		}
+	}
+
+	// Arity check — comes before arg compilation so a wrong count is reported as
+	// CodeBadFuncArity, not as a confusing downstream type error.
+	if len(nn.Args) != len(spec.ParamKinds) {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function %q expects %d argument(s), got %d", nn.Name, len(spec.ParamKinds), len(nn.Args)),
+		}
+	}
+
+	// Compile args and check per-argument Kind against the declared ParamKinds.
+	// KindInvalid in ParamKinds acts as "any" — the argument's Kind is accepted
+	// unconditionally. For every other declared Kind the argument's compile-time
+	// Kind must match exactly.
 	args := make([]op, 0, len(nn.Args))
-	for _, a := range nn.Args {
+	for i, a := range nn.Args {
 		compiled, err := c.compileNode(a)
 		if err != nil {
 			return nil, err
 		}
+		want := spec.ParamKinds[i]
+		got := c.nodeKind(compiled)
+		if want != rule.KindInvalid && got != want {
+			return nil, &CompileError{
+				Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+				Message: fmt.Sprintf("function %q argument %d: expected %s, got %s", nn.Name, i+1, want, got),
+			}
+		}
 		args = append(args, compiled)
 	}
 
-	// v1 function table — closed and empty. Any FuncCall is rejected. See D14.
-	return nil, &CompileError{
-		Line: nn.Line, Col: nn.Col, Code: CodeUnknownFunction,
-		Message: fmt.Sprintf("function %q is not in the v1 function table", nn.Name),
-	}
+	return &opFunc{pos: posOf(nn), name: nn.Name, args: args, spec: spec}, nil
 }
 
 // ========================== Logic ops =======================================================
@@ -915,7 +956,7 @@ func typeMismatchErr(src *parser.Cmp, format string, args ...any) *CompileError 
 // nodeKind extracts the underlying Value Kind from a plan op. For literal ops the
 // Kind is taken from the stored Value. For non-literal ops the Kind is what the
 // op WOULD produce at evaluation time: Bool for logic ops, Bool for the boolean-
-// returning operators, etc.
+// returning operators, the function's declared ReturnKind for opFunc, etc.
 //
 // This is a compile-time concept, not a runtime evaluation — it tells the type
 // checker what Kind each op has, so it can match against operator signatures.
@@ -953,10 +994,10 @@ func (c *Compiler) nodeKind(o op) rule.Kind {
 	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn, *opStrict:
 		return rule.KindBool
 	case *opFunc:
-		// v1: functions are all rejected, so this branch is unreachable in a
-		// successful compile. If a future flow registers functions, this is the
-		// place to consult the function table for its declared return Kind.
-		return rule.KindInvalid
+		// Return the function's declared return Kind (D16 §2). The spec is
+		// populated by compileFuncCall at compile time, so downstream operators
+		// and comparisons type-check against the function's actual return.
+		return n.spec.ReturnKind
 	}
 	return rule.KindInvalid
 }

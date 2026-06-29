@@ -12,7 +12,7 @@
 //    10.  in with literal array.
 //    11.  Strict placement OK: http.status eq strict 200.
 //    12.  Strict placement error: strict (a or b).
-//    13.  FuncCall rejected: lower(http.method) → unknown_function.
+//    13.  FuncCall unknown name rejected (Flow 002 D16): no_such_function(...) → unknown_function.
 //    14.  BracketAccess OK on Map field.
 //    15.  BracketAccess error: object not Map-typed.
 //    16.  BracketAccess error: key not string literal.
@@ -344,16 +344,22 @@ func TestCompiler_StrictOnRightOfCmp(t *testing.T) {
 	}
 }
 
-// ========================== 13. FuncCall rejected ===========================================
+// ========================== 13. Function registry compile errors ===========================
 
-// TestCompiler_FuncCallRejected covers test 13: any FuncCall in v1 is rejected. The
-// function table is closed AND empty. The error code is CodeUnknownFunction.
-func TestCompiler_FuncCallRejected(t *testing.T) {
-	ce := compileErr(t, `lower(http.method)`, wafScheme(t))
+// TestCompiler_FuncCall_UnknownName covers test 13a: a function name that is not in
+// the registry is rejected with CodeUnknownFunction. The negative surface is split
+// from the original TestCompiler_FuncCallRejected because the registry now has real
+// entries; arity / arg-type negatives land below (TestCompiler_FuncCall_BadArity,
+// TestCompiler_FuncCall_BadArgType) and depend on a real registered function.
+//
+// This is the only D16 §2 negative that can run without depending on a specific
+// registered function — every other negative tests against a function that exists.
+func TestCompiler_FuncCall_UnknownName(t *testing.T) {
+	ce := compileErr(t, `no_such_function(http.method)`, wafScheme(t))
 	if ce.Code != CodeUnknownFunction {
 		t.Errorf("got Code %q, want %q", ce.Code, CodeUnknownFunction)
 	}
-	if !strings.Contains(ce.Message, "lower") {
+	if !strings.Contains(ce.Message, "no_such_function") {
 		t.Errorf("Message %q should mention the function name", ce.Message)
 	}
 }

@@ -21,8 +21,11 @@
 //     - Compilation / type-checking — lives in compiler.go (Task C1).
 //     - Field resolvers — EnvelopeResolver lives in pkg/rule, plugin resolvers in
 //       their respective plugins (DECISION D3).
-//     - Function-table execution — v1 function table is closed and empty; the
-//       evaluator surfaces a defensive false for opFunc rather than panicking.
+//     - Function-table execution — the v0.3.0 function table (DECISION D16) is
+//       closed and populated. compileFuncCall rejects unknown names / wrong arity
+//       / per-argument Kind mismatches at compile time; the evaluator dispatches
+//       via the spec's Eval entry point and surfaces a defensive false if any
+//       argument fails to resolve.
 //
 //   DEPENDENCY RULE:
 //     stdlib only (D2): net, regexp, strings. Plus sibling pkg/rule
@@ -187,13 +190,9 @@ func eval(o op, resolver rule.FieldResolver, event *plugin.Event) bool {
 		// syntactic marker only. Just evaluate the inner op.
 		return eval(n.inner, resolver, event)
 
-	// ── Function call — unreachable in v1 (C1 rejects all FuncCalls) ──────────
+	// ── Function call — dispatch via the registry (DECISION D16) ──────────────
 	case *opFunc:
-		// Defensive: should never happen on a Plan produced by a successful
-		// Compile call (compileFuncCall rejects every FuncCall with
-		// CodeUnknownFunction). A manually-built Plan containing opFunc would
-		// reach here; surfacing false avoids a panic.
-		return false
+		return evalFuncCall(n, resolver, event)
 	}
 	// Unreachable for any Plan produced by the compiler (every concrete op type
 	// is handled above). Defensive false.
@@ -550,15 +549,59 @@ func itoaPrefix(p int) string {
 	return "128"
 }
 
+// ========================== Function dispatch ===============================================
+
+// evalFuncCall is the eval-side dispatch for *opFunc in predicate position (the root
+// of a Plan). The compile-time signature check (compileFuncCall, DECISION D16 §2)
+// has already verified the function name, arity, and per-argument Kinds — at eval
+// time we resolve each argument to a Value via evalValue and invoke the spec's
+// Eval entry point.
+//
+// If any argument fails to resolve (e.g. a field reference whose resolver returned
+// no value), the call is surfaced as "no match" (false) rather than panicking —
+// the same defensive contract as every other op in the evaluator.
+//
+// A function that returns a non-Bool Kind is misused at the root of a Plan (the
+// language expects a predicate). Defensive false.
+func evalFuncCall(n *opFunc, resolver rule.FieldResolver, event *plugin.Event) bool {
+	v, ok := evalFuncCallValue(n, resolver, event)
+	if !ok {
+		return false
+	}
+	b, ok := v.AsBool()
+	if !ok {
+		return false
+	}
+	return b
+}
+
+// evalFuncCallValue is the value-returning counterpart of evalFuncCall. It is used
+// by evalValue when the function appears in value position (e.g. inside a Cmp
+// operand: `lower(field) eq "abc"`). Returns the function's result Value plus an
+// ok flag — false if any argument failed to resolve.
+func evalFuncCallValue(n *opFunc, resolver rule.FieldResolver, event *plugin.Event) (rule.Value, bool) {
+	args := make([]rule.Value, len(n.args))
+	for i, a := range n.args {
+		v, ok := evalValue(a, resolver, event)
+		if !ok {
+			return rule.Value{}, false
+		}
+		args[i] = v
+	}
+	return n.spec.Eval(args), true
+}
+
 // evalValue walks an op and returns the Value it produces, plus an "ok" flag.
-// Used by the comparison / string / In ops to get the operand values.
+// Used by the comparison / string / In ops to get the operand values, and by
+// evalFuncCallValue to resolve function arguments.
 //
 // For literal ops the Value is stored directly and returned without any resolver
-// involvement. For field / bracket ops the resolver is consulted. For nested
-// composite ops (Cmp, Contains, In, ...) we surface a defensive failure: a
-// comparison / membership op expects scalar operands, never another predicate.
-// The compiler rejects this shape, so reaching here is unreachable on a
-// compiler-produced Plan; we keep the guard for hand-built plans.
+// involvement. For field / bracket ops the resolver is consulted. For function
+// calls the args are resolved and the spec's Eval entry point produces the result.
+// For nested composite ops (Cmp, Contains, In, ...) we surface a defensive
+// failure: a comparison / membership op expects scalar operands, never another
+// predicate. The compiler rejects this shape, so reaching here is unreachable
+// on a compiler-produced Plan; we keep the guard for hand-built plans.
 func evalValue(o op, resolver rule.FieldResolver, event *plugin.Event) (rule.Value, bool) {
 	switch n := o.(type) {
 	// ── Literals — return the stored Value directly (zero alloc) ─────────────
@@ -603,10 +646,14 @@ func evalValue(o op, resolver rule.FieldResolver, event *plugin.Event) (rule.Val
 	case *opStrict:
 		return evalValue(n.inner, resolver, event)
 
+	// ── Function call — resolve args and dispatch via the spec (D16) ───────────
+	case *opFunc:
+		return evalFuncCallValue(n, resolver, event)
+
 	// ── Defensive — predicate ops are not Values ───────────────────────────────
 	case *opLitArray, *opAnd, *opOr, *opNot, *opCmp,
 		*opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard,
-		*opIn, *opFunc:
+		*opIn:
 		return rule.Value{}, false
 	}
 	return rule.Value{}, false
