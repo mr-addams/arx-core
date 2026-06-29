@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/mr-addams/arx-core/pkg/plugin"
 )
 
 // ========================== FieldType — closed set ==========================================
@@ -47,6 +49,34 @@ func TestFieldType_KnownTypes(t *testing.T) {
 	for _, ft := range notWant {
 		if isKnownFieldType(ft) {
 			t.Errorf("expected FieldType %q to be unknown", ft)
+		}
+	}
+}
+
+// TestFieldType_AliasIdentity pins the alias relationship between rule.FieldType and
+// plugin.FieldType (DECISION D8.1). The type-system identity must hold so existing
+// callers compile unchanged; the closed constant set must match plugin's.
+func TestFieldType_AliasIdentity(t *testing.T) {
+	// Bidirectional assignment without conversion — this only compiles if FieldType
+	// (alias) IS plugin.FieldType, not just convertible. If the alias is ever broken
+	// into a distinct named type, this line fails to compile and the test forces a
+	// deliberate decision.
+	var rt FieldType = plugin.TypeString
+	var pt plugin.FieldType = TypeString
+	if rt != pt {
+		t.Errorf("alias identity broken: rule.TypeString (%q) != plugin.TypeString (%q)", rt, pt)
+	}
+
+	// The full closed set must match across the alias boundary — otherwise a constant
+	// in one package would resolve to a different value in the other, silently breaking
+	// every existing call site that referenced rule.TypeXxx.
+	for _, c := range []FieldType{
+		TypeString, TypeInt, TypeFloat, TypeBool,
+		TypeIP, TypeBytes, TypeTimestamp, TypeDuration,
+		TypeArray, TypeMap,
+	} {
+		if !isKnownFieldType(c) {
+			t.Errorf("aliased constant %q not in isKnownFieldType set", c)
 		}
 	}
 }

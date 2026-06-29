@@ -12,9 +12,11 @@
 //   each carrying the FieldInfo set the profile is allowed to reference.
 //
 //   WHAT IS HERE:
-//     - FieldType — string-typed mirror of the Value Kind enum (D5). Keeps pkg/rule
-//       field types self-describing and stable across versions without dragging the
-//       Kind numeric values into the field contract.
+//     - FieldType — type alias re-exported from pkg/plugin (DECISION D8.1). The canonical
+//       definition lives in pkg/plugin/manifest.go next to FieldDecl; pkg/rule carries
+//       an alias and the constant block so existing callers (compiler, parser, evaluator,
+//       tests, future builder) keep compiling without importing pkg/plugin. A
+//       rule.FieldType IS a plugin.FieldType (same identity, not just convertible).
 //     - FieldInfo — Namespace + Name + Type triple, the unit of registration and
 //       projection.
 //     - Catalog — thread-safe Registry (D6, D13): Register / Fields / Has / Revision.
@@ -29,8 +31,9 @@
 //
 //   DEPENDENCY RULE:
 //     pkg/rule → stdlib only, plus sibling arx-core/pkg/plugin for the Event boundary
-//     referenced by FieldResolver (resolver.go). Catalog and Scheme themselves never
-//     touch pkg/plugin — they are pure data.
+//     referenced by FieldResolver (resolver.go) AND for the canonical FieldType
+//     definition (D8.1). Catalog and Scheme themselves never touch pkg/plugin — they
+//     are pure data.
 //
 //   CONCURRENCY:
 //     - Register holds the write lock and bumps an atomic Revision counter, so
@@ -47,34 +50,42 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"github.com/mr-addams/arx-core/pkg/plugin"
 )
 
-// ========================== FieldType — typed mirror of Kind ===============================
+// ========================== FieldType — alias re-exported from pkg/plugin ==================
 
-// FieldType is the stable, version-independent name of a field's value kind. It mirrors
-// the Kind enum (DECISION D5) as a string constant so the field contract — what a
-// downstream plugin manifest and the rule-language type-checker exchange — stays textual
-// rather than dependent on the underlying numeric Kind values.
+// FieldType is the field-type contract owned by pkg/plugin (DECISION D8.1) and aliased
+// here so callers of pkg/rule do not need to import pkg/plugin for it. The alias is
+// bidirectional at the type-system level: a `rule.FieldType` IS a `plugin.FieldType`
+// (same identity, not just convertible). Existing code referencing rule.FieldType —
+// FieldInfo.Type, Catalog.Register, every C1/C2 op node, all tests — keeps working
+// unchanged because the alias resolves to the same underlying type.
 //
-// KindInvalid (the "absent field" sentinel) is intentionally NOT represented: it is a
-// runtime sentinel, not a declared field type. A future Kind added without a
-// corresponding FieldType constant will be rejected by Register with ErrUnknownFieldType.
-type FieldType string
+// The canonical definition and the constants block are in pkg/plugin/manifest.go. The
+// rules of placement (why the type lives in pkg/plugin and not here) are documented
+// there under the "FieldType — field contract mirror of Kind" block.
+type FieldType = plugin.FieldType
 
-// Field type constants. The string value is part of the engine's diagnostic surface
-// (rule-language type names, error messages, Manifest exports) — treat changes as
-// breaking.
-const (
-	TypeString    FieldType = "string"
-	TypeInt       FieldType = "int"
-	TypeFloat     FieldType = "float"
-	TypeBool      FieldType = "bool"
-	TypeIP        FieldType = "ip"
-	TypeBytes     FieldType = "bytes"
-	TypeTimestamp FieldType = "timestamp"
-	TypeDuration  FieldType = "duration"
-	TypeArray     FieldType = "array"
-	TypeMap       FieldType = "map"
+// Re-exported constants under the rule package name so existing call sites —
+// isKnownFieldType below, every Register invocation in tests, every op node construction
+// in the compiler — keep compiling unchanged. Treat changes to the constant set as
+// breaking: pkg/plugin is the source of truth, and isKnownFieldType is the closed-set
+// gate that catches typos.
+var (
+	// These aliases MUST stay in lockstep with the canonical definitions in pkg/plugin
+	// (DECISION D8.1 — pkg/plugin/manifest.go is the single source of truth).
+	TypeString    = plugin.TypeString
+	TypeInt       = plugin.TypeInt
+	TypeFloat     = plugin.TypeFloat
+	TypeBool      = plugin.TypeBool
+	TypeIP        = plugin.TypeIP
+	TypeBytes     = plugin.TypeBytes
+	TypeTimestamp = plugin.TypeTimestamp
+	TypeDuration  = plugin.TypeDuration
+	TypeArray     = plugin.TypeArray
+	TypeMap       = plugin.TypeMap
 )
 
 // ========================== FieldInfo — registration unit =================================
