@@ -77,6 +77,17 @@ type FuncSpec struct {
 	// does NOT act on it at runtime. It exists so tests can pin the contract.
 	Allocating bool
 
+	// IsVariadic marks the function as variadic: it accepts zero or more
+	// arguments, and the LAST ParamKinds element is the kind of every variadic
+	// argument beyond the minimum-arity prefix. The minimum arity is
+	// len(ParamKinds) - 1 for a variadic function (so a variadic with one
+	// ParamKind accepts zero-or-more args; a non-variadic function accepts
+	// exactly len(ParamKinds) args).
+	//
+	// Default false: the v0.3.0 closed set has exactly one variadic entry —
+	// concat(args... :string). All others are fixed-arity.
+	IsVariadic bool
+
 	// Eval is the eval entry point. It receives the function's arguments as
 	// already-resolved Values (matching ParamKinds in order) and returns the
 	// resulting Value. Implementations MUST be safe for concurrent use — Eval

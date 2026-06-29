@@ -369,6 +369,590 @@ func TestEval_FuncFailsGracefullyOnUnresolvedArg(t *testing.T) {
 	}
 }
 
+// ========================== D2 — allocating string functions =================================
+//
+// Coverage for the D2 set (substring / concat / url_decode / url_encode /
+// html_entity_decode / remove_bytes). All D2 functions are Allocating=true; the
+// tests verify the contract from the registry metadata, the compile-time
+// signature checks, and the eval-time behaviour including the explicit bounds
+// and error-fallback policies.
+
+// ========================== 6. Registry metadata for D2 =====================================
+
+// TestRegistry_LookupD2 verifies the registry metadata for each D2 entry — the
+// expected ParamKinds, ReturnKind, Allocating=true, and (for concat) IsVariadic.
+func TestRegistry_LookupD2(t *testing.T) {
+	cases := []struct {
+		name     string
+		arity    int
+		variadic bool
+		returnK  rule.Kind
+		alloc    bool
+	}{
+		{"substring", 3, false, rule.KindString, true},
+		{"concat", 1, true, rule.KindString, true},
+		{"url_decode", 1, false, rule.KindString, true},
+		{"url_encode", 1, false, rule.KindString, true},
+		{"html_entity_decode", 1, false, rule.KindString, true},
+		{"remove_bytes", 2, false, rule.KindString, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			spec, ok := Lookup(c.name)
+			if !ok {
+				t.Fatalf("Lookup(%q): not found", c.name)
+			}
+			if len(spec.ParamKinds) != c.arity {
+				t.Errorf("arity = %d, want %d", len(spec.ParamKinds), c.arity)
+			}
+			if spec.IsVariadic != c.variadic {
+				t.Errorf("IsVariadic = %v, want %v", spec.IsVariadic, c.variadic)
+			}
+			if spec.ReturnKind != c.returnK {
+				t.Errorf("ReturnKind = %s, want %s", spec.ReturnKind, c.returnK)
+			}
+			if spec.Allocating != c.alloc {
+				t.Errorf("Allocating = %v, want %v", spec.Allocating, c.alloc)
+			}
+			if spec.Eval == nil {
+				t.Errorf("Eval is nil; registry entry is invalid")
+			}
+		})
+	}
+}
+
+// ========================== 7. Compile-time negatives for D2 ================================
+
+// TestCompiler_D2_BadArity pins CodeBadFuncArity for each D2 entry. concat is
+// excluded here — its variadic arity check has a separate test (TestCompiler_Concat_*).
+func TestCompiler_D2_BadArity(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"substring_too_few", `substring(http.uri)`},
+		{"substring_too_many", `substring(http.uri, 0, 1, 2)`},
+		{"url_decode_too_many", `url_decode(http.uri, http.method)`},
+		{"url_encode_too_few", `url_encode()`},
+		{"html_entity_decode_too_many", `html_entity_decode(http.uri, http.uri)`},
+		{"remove_bytes_too_few", `remove_bytes(http.uri)`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ce := compileErr(t, c.src, wafScheme(t))
+			if ce.Code != CodeBadFuncArity {
+				t.Errorf("got Code %q, want %q", ce.Code, CodeBadFuncArity)
+			}
+		})
+	}
+}
+
+// TestCompiler_D2_BadArgType pins CodeBadFuncArgType for representative D2
+// entries. The first positional Int arg of substring is exercised against a
+// String-typed field; remove_bytes expects both args String and gets a wrong
+// type on the second slot.
+func TestCompiler_D2_BadArgType(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		// substring(int_field, int_field, int_field) — start expects int → OK;
+		// but http.uri is String and the second int slot is http.uri (String).
+		// We exercise the FIRST slot: substring(http.method, 0, 1) — but the
+		// first slot is String, and http.method IS String, so that's fine.
+		// The simplest mismatch is the SECOND slot (Int) being a String field.
+		{"substring_string_for_int", `substring(http.uri, http.uri, 1)`},
+		{"remove_bytes_string_for_int", `remove_bytes(http.uri, http.status)`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ce := compileErr(t, c.src, wafScheme(t))
+			if ce.Code != CodeBadFuncArgType {
+				t.Errorf("got Code %q, want %q", ce.Code, CodeBadFuncArgType)
+			}
+		})
+	}
+}
+
+// TestCompiler_Concat_Variadic pins the variadic arity check. concat accepts
+// zero or more args (IsVariadic with a single ParamKinds entry); an entry must
+// compile, and any positive count must compile.
+func TestCompiler_Concat_Variadic(t *testing.T) {
+	cases := []string{
+		`concat()`,
+		`concat(http.uri)`,
+		`concat(http.uri, http.method)`,
+		`concat(http.uri, http.method, http.uri)`,
+	}
+	for _, src := range cases {
+		t.Run(src, func(t *testing.T) {
+			if _, err := Compile(mustParse(t, src), wafScheme(t)); err != nil {
+				t.Fatalf("Compile(%q): %v", src, err)
+			}
+		})
+	}
+}
+
+// TestCompiler_Concat_Variadic_BadArgType pins that concat's variadic slot
+// rejects non-String args. http.status is Int; concat(http.uri, http.status)
+// must fail with CodeBadFuncArgType.
+func TestCompiler_Concat_Variadic_BadArgType(t *testing.T) {
+	ce := compileErr(t, `concat(http.uri, http.status)`, wafScheme(t))
+	if ce.Code != CodeBadFuncArgType {
+		t.Errorf("got Code %q, want %q", ce.Code, CodeBadFuncArgType)
+	}
+}
+
+// ========================== 8. Eval coverage for D2 =========================================
+
+// evalFuncString compiles a function-call expression whose return value is
+// KindString and compares it against an expected string via `eq`. This is the
+// standard "value-position" pattern: the function result is the left operand
+// of a Cmp, which exercises both the function's Eval and the evaluator's
+// value-position path through opFunc (Group C).
+func evalFuncString(t *testing.T, src, want string, scalars map[string]rule.Value) {
+	t.Helper()
+	scheme := evalWafScheme(t)
+	ev := fixedEvent()
+	p := evalCompileOK(t, src, scheme)
+	r := &mapResolver{scalars: scalars}
+	if !p.Eval(r, ev) {
+		t.Errorf("Eval(%q) returned false; want match against %q", src, want)
+	}
+}
+
+// TestEval_D2_Substring covers the bounds-clamp policy of substring:
+//   - normal range
+//   - empty range (start == end)
+//   - inverted range (start > end after clamp) → ""
+//   - end > len → clamped to len
+//   - both clamped → covers all
+//   - empty input → ""
+//   - multi-byte UTF-8 (byte-indexed, matching len())
+//
+// Note: the language grammar has no unary minus, so a negative literal start is
+// a parse error — the runtime clamp on `start < 0` is defensive for runtime-
+// supplied Values (a field of Int Kind) and is not reachable from a literal.
+// start >= 0 is therefore the only case the test exercises.
+func TestEval_D2_Substring(t *testing.T) {
+	type tc struct {
+		name string
+		src  string
+		want string
+		in   string // field value to bind to http.uri
+	}
+	cases := []tc{
+		{"mid_range", `substring(http.uri, 1, 4) eq "bcd"`, "bcd", "abcdef"},
+		{"start_at_zero", `substring(http.uri, 0, 3) eq "abc"`, "abc", "abcdef"},
+		{"end_at_len", `substring(http.uri, 3, 6) eq "def"`, "def", "abcdef"},
+		{"empty_range", `substring(http.uri, 2, 2) eq ""`, "", "abcdef"},
+		{"inverted_range", `substring(http.uri, 4, 1) eq ""`, "", "abcdef"},
+		{"end_overflow_clamped", `substring(http.uri, 2, 999) eq "cdef"`, "cdef", "abcdef"},
+		{"both_clamped_covers_all", `substring(http.uri, 0, 999) eq "abcdef"`, "abcdef", "abcdef"},
+		// Multi-byte UTF-8: substring is byte-indexed (matches len()).
+		// "/π/" is 4 bytes; bytes [1:3] are the bytes of π (= "\xcf\x80").
+		{"utf8_mid_rune", `substring(http.uri, 1, 3) eq "` + "\xcf\x80" + `"`, "\xcf\x80", "/π/"},
+		// Single-byte ASCII in UTF-8 string: bytes [1:4] of "xπy" are the
+		// bytes of π.
+		{"utf8_rune_at_end", `substring(http.uri, 1, 3) eq "` + "\xcf\x80" + `"`, "\xcf\x80", "xπy"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri": rule.NewString(c.in),
+			})
+		})
+	}
+
+	// Empty input — separate case because the input itself differs.
+	emptyCases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"empty_input_full_range", `substring(http.uri, 0, 5) eq ""`, ""},
+		{"empty_input_zero_zero", `substring(http.uri, 0, 0) eq ""`, ""},
+		{"empty_input_inverted", `substring(http.uri, 1, 0) eq ""`, ""},
+	}
+	for _, c := range emptyCases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri": rule.NewString(""),
+			})
+		})
+	}
+}
+
+// TestEval_D2_Concat covers concat in predicate-position (value compared with
+// eq). Variadic arities 0..4 are exercised.
+func TestEval_D2_Concat(t *testing.T) {
+	type tc struct {
+		name string
+		src  string
+		want string
+	}
+	cases := []tc{
+		{"zero_args", `concat() eq ""`, ""},
+		{"one_arg", `concat(http.uri) eq "/api"`, "/api"},
+		{"two_args", `concat(http.uri, http.method) eq "/apiGET"`, "/apiGET"},
+		{"three_args_mixed", `concat(http.uri, "/", http.method) eq "/api/GET"`, "/api/GET"},
+		{"empty_arg_skipped", `concat(http.uri, "", http.method) eq "/apiGET"`, "/apiGET"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri":    rule.NewString("/api"),
+				"http.method": rule.NewString("GET"),
+			})
+		})
+	}
+}
+
+// TestEval_D2_URLDecode covers url_decode. Each row carries (in, want) separately
+// because the input is the percent-encoded form and the expected output is the
+// decoded form — they are different strings. The invalid-percent row pins the
+// best-effort fallback: malformed input is surfaced as the empty string.
+func TestEval_D2_URLDecode(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+		src            string
+	}{
+		{"plain", "hello%20world", "hello world", `url_decode(http.uri) eq "hello world"`},
+		{"percent_plus", "a%2Bb", "a+b", `url_decode(http.uri) eq "a+b"`},
+		{"round_trip", "%2Fapi%3Fx%3D1%26y%3D2", "/api?x=1&y=2", `url_decode(http.uri) eq "/api?x=1&y=2"`},
+		{"unicode_pct", "%CF%80", "π", `url_decode(http.uri) eq "π"`},
+		{"invalid_percent", "%zz", "", `url_decode(http.uri) eq ""`},
+		{"empty", "", "", `url_decode(http.uri) eq ""`},
+		{"already_plain", "abc", "abc", `url_decode(http.uri) eq "abc"`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri": rule.NewString(c.in),
+			})
+		})
+	}
+}
+
+// TestEval_D2_URLEncode covers url_encode. The encoding is the form used in
+// query strings — space → "+", "/" → "%2F", "?" → "%3F", etc. (RFC 3986).
+func TestEval_D2_URLEncode(t *testing.T) {
+	type tc struct {
+		name, in, want string
+		src            string
+	}
+	cases := []tc{
+		{"plain", "abc", "abc", `url_encode(http.uri) eq "abc"`},
+		{"space_to_plus", "a b", "a+b", `url_encode(http.uri) eq "a+b"`},
+		{"slash_encoded", "/api", "%2Fapi", `url_encode(http.uri) eq "%2Fapi"`},
+		{"query_string", "x=1&y=2", "x%3D1%26y%3D2", `url_encode(http.uri) eq "x%3D1%26y%3D2"`},
+		{"unicode", "π", "%CF%80", `url_encode(http.uri) eq "%CF%80"`},
+		{"empty", "", "", `url_encode(http.uri) eq ""`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri": rule.NewString(c.in),
+			})
+		})
+	}
+}
+
+// TestEval_D2_HTMLEntityDecode covers html_entity_decode. Named entities, numeric
+// entities, mixed text, and unknown entities are exercised.
+func TestEval_D2_HTMLEntityDecode(t *testing.T) {
+	type tc struct {
+		name, in, want string
+		src            string
+	}
+	cases := []tc{
+		{"amp", "a&amp;b", "a&b", `html_entity_decode(http.uri) eq "a&b"`},
+		{"lt_gt", "&lt;tag&gt;", "<tag>", `html_entity_decode(http.uri) eq "<tag>"`},
+		{"quot", "&quot;x&quot;", `"x"`, `html_entity_decode(http.uri) eq "\"x\""`},
+		{"numeric_decimal", "&#65;", "A", `html_entity_decode(http.uri) eq "A"`},
+		{"numeric_hex", "&#x41;", "A", `html_entity_decode(http.uri) eq "A"`},
+		{"mixed", "Tom &amp; Jerry &lt;3", "Tom & Jerry <3", `html_entity_decode(http.uri) eq "Tom & Jerry <3"`},
+		{"unknown_passthrough", "&unknown;", "&unknown;", `html_entity_decode(http.uri) eq "&unknown;"`},
+		{"empty", "", "", `html_entity_decode(http.uri) eq ""`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri": rule.NewString(c.in),
+			})
+		})
+	}
+}
+
+// TestEval_D2_RemoveBytes covers remove_bytes. set is a SET OF BYTES; the empty
+// set is the identity; mixed-byte and pure-ASCII cases are exercised.
+func TestEval_D2_RemoveBytes(t *testing.T) {
+	type tc struct {
+		name, in, set, want string
+		src                 string
+	}
+	cases := []tc{
+		{"empty_set_is_identity", "hello", "", "hello", `remove_bytes(http.uri, "") eq "hello"`},
+		{"remove_spaces", "hello world foo", " ", "helloworldfoo", `remove_bytes(http.uri, " ") eq "helloworldfoo"`},
+		{"remove_control_chars", "ab\tcd\nef", "\t\n", "abcdef", `remove_bytes(http.uri, "\t\n") eq "abcdef"`},
+		{"remove_digits", "v1.2.3-rc4", "0123456789", "v..-rc", `remove_bytes(http.uri, "0123456789") eq "v..-rc"`},
+		{"set_larger_than_kept", "abc", "abcdef", "", `remove_bytes(http.uri, "abcdef") eq ""`},
+		{"no_overlap", "hello", "xyz", "hello", `remove_bytes(http.uri, "xyz") eq "hello"`},
+		{"empty_input", "", "abc", "", `remove_bytes(http.uri, "abc") eq ""`},
+		// Byte-set (not rune-set): "café" — 'c' (0x63), 'a' (0x61), 'f' (0x66),
+		// 'é' = 0xC3 0xA9. Removing byte 'a' (0x61) drops only the 'a' byte; 'é'
+		// stays intact because neither 0xC3 nor 0xA9 equals 0x61. The result
+		// "cfé" is therefore valid UTF-8 (c, f, é).
+		{"byte_set_keeps_multibyte", "café", "a", "cfé", `remove_bytes(http.uri, "a") eq "cfé"`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri": rule.NewString(c.in),
+			})
+		})
+	}
+}
+
+// ========================== D3 — regex_replace / lookup_json_string ===========================
+//
+// Coverage for the D3 set. regex_replace has a compile-time precompile fast path
+// for literal patterns (DECISION D4) and a per-eval fallback for non-literal
+// patterns. lookup_json_string parses the json arg as a top-level JSON object
+// and returns the string at the given key — misses return "".
+
+// TestRegistry_LookupD3 verifies the registry metadata for the D3 entries.
+func TestRegistry_LookupD3(t *testing.T) {
+	cases := []struct {
+		name    string
+		arity   int
+		returnK rule.Kind
+		alloc   bool
+	}{
+		{"regex_replace", 3, rule.KindString, true},
+		{"lookup_json_string", 2, rule.KindString, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			spec, ok := Lookup(c.name)
+			if !ok {
+				t.Fatalf("Lookup(%q): not found", c.name)
+			}
+			if len(spec.ParamKinds) != c.arity {
+				t.Errorf("arity = %d, want %d", len(spec.ParamKinds), c.arity)
+			}
+			if spec.ReturnKind != c.returnK {
+				t.Errorf("ReturnKind = %s, want %s", spec.ReturnKind, c.returnK)
+			}
+			if spec.Allocating != c.alloc {
+				t.Errorf("Allocating = %v, want %v", spec.Allocating, c.alloc)
+			}
+			if spec.Eval == nil {
+				t.Errorf("Eval is nil; registry entry is invalid")
+			}
+			if spec.IsVariadic {
+				t.Errorf("IsVariadic = true; D3 functions are fixed-arity")
+			}
+		})
+	}
+}
+
+// TestCompiler_RegexReplace_BadArity pins CodeBadFuncArity.
+func TestCompiler_RegexReplace_BadArity(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"too_few", `regex_replace(http.uri)`},
+		{"too_few_two", `regex_replace(http.uri, "[0-9]")`},
+		{"too_many", `regex_replace(http.uri, "[0-9]", "x", "extra")`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ce := compileErr(t, c.src, wafScheme(t))
+			if ce.Code != CodeBadFuncArity {
+				t.Errorf("got Code %q, want %q", ce.Code, CodeBadFuncArity)
+			}
+		})
+	}
+}
+
+// TestCompiler_RegexReplace_BadArgType pins CodeBadFuncArgType for each arg.
+func TestCompiler_RegexReplace_BadArgType(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		// arg 2 is the pattern; http.status is Int — bad.
+		{"pattern_not_string", `regex_replace(http.uri, http.status, "x")`},
+		// arg 3 is the replacement; http.status is Int — bad.
+		{"repl_not_string", `regex_replace(http.uri, "[0-9]", http.status)`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ce := compileErr(t, c.src, wafScheme(t))
+			if ce.Code != CodeBadFuncArgType {
+				t.Errorf("got Code %q, want %q", ce.Code, CodeBadFuncArgType)
+			}
+		})
+	}
+}
+
+// TestCompiler_RegexReplace_BadPattern pins CodeBadRegex for an invalid literal
+// pattern. This is the COMPILE-time check — the regex never makes it to eval.
+func TestCompiler_RegexReplace_BadPattern(t *testing.T) {
+	ce := compileErr(t, `regex_replace(http.uri, "[invalid", "x")`, wafScheme(t))
+	if ce.Code != CodeBadRegex {
+		t.Errorf("got Code %q, want %q", ce.Code, CodeBadRegex)
+	}
+	if !strings.Contains(ce.Message, "[invalid") {
+		t.Errorf("Message %q should mention the bad pattern", ce.Message)
+	}
+}
+
+// TestEval_D3_RegexReplace covers the literal-pattern fast path:
+//   - simple substitution
+//   - no match (returns subject unchanged)
+//   - all-match (subject is entirely the pattern)
+//   - empty subject
+//   - replacement with backreferences ($1)
+//   - character classes ([0-9], [a-z])
+//   - anchors (^, $)
+//   - multi-word subjects
+//   - empty replacement (delete the matches)
+func TestEval_D3_RegexReplace(t *testing.T) {
+	type tc struct {
+		name, src, in, want string
+	}
+	cases := []tc{
+		{"digits_to_x", `regex_replace(http.uri, "[0-9]", "x") eq "vx.x.x-rcx"`, "v1.2.3-rc4", "vx.x.x-rcx"},
+		{"no_match", `regex_replace(http.uri, "[0-9]", "x") eq "abc"`, "abc", "abc"},
+		{"all_match", `regex_replace(http.uri, "[0-9]", "x") eq "xxxx"`, "1234", "xxxx"},
+		{"empty_subject", `regex_replace(http.uri, "[0-9]", "x") eq ""`, "", ""},
+		// Backreferences in the replacement — RE2 syntax ($1).
+		{"backref", `regex_replace(http.uri, "(world)", "hello $1!") eq "hello world!"`, "world", "hello world!"},
+		// Anchors.
+		{"anchor_start", `regex_replace(http.uri, "^foo", "X") eq "Xbar"`, "foobar", "Xbar"},
+		// Delete the match.
+		{"empty_replacement", `regex_replace(http.uri, "[0-9]+", "") eq "abcdef"`, "abc123def", "abcdef"},
+		// Multi-word subject — each [a-z]+ run is replaced (RE2 non-overlapping
+		// match-and-replace, separated by spaces).
+		{"multi_word", `regex_replace(http.uri, "[a-z]+", "Z") eq "Z Z Z"`, "abc def ghi", "Z Z Z"},
+		// Subject unchanged when pattern is a literal that does not occur.
+		{"unicode_kept", `regex_replace(http.uri, "X", "Y") eq "/π/"`, "/π/", "/π/"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri": rule.NewString(c.in),
+			})
+		})
+	}
+}
+
+// TestEval_D3_RegexReplace_NonLiteralPattern covers the per-eval compile path:
+// the pattern argument is a field reference (http.pattern) rather than a literal,
+// so the compiler does NOT precompile the regex; the evaluator compiles it per
+// call (DECISION D4 non-literal fallback). This exercises the real production
+// path through evalRegexReplaceValue — not the registry's evalRegexReplaceFallback,
+// which is the same algorithm but reachable only via hand-built ops.
+func TestEval_D3_RegexReplace_NonLiteralPattern(t *testing.T) {
+	scheme := evalWafScheme(t)
+	ev := fixedEvent()
+	src := `regex_replace(http.uri, http.pattern, "X") eq "vX.X.X-rcX"`
+	p := evalCompileOK(t, src, scheme)
+	r := &mapResolver{scalars: map[string]rule.Value{
+		"http.uri":     rule.NewString("v1.2.3-rc4"),
+		"http.pattern": rule.NewString("[0-9]"),
+	}}
+	if !p.Eval(r, ev) {
+		t.Errorf("non-literal pattern eval returned false; expected replacement")
+	}
+}
+
+// TestCompiler_LookupJSONString_BadArity pins CodeBadFuncArity.
+func TestCompiler_LookupJSONString_BadArity(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"too_few", `lookup_json_string(http.uri)`},
+		{"too_many", `lookup_json_string(http.uri, "k", "extra")`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ce := compileErr(t, c.src, wafScheme(t))
+			if ce.Code != CodeBadFuncArity {
+				t.Errorf("got Code %q, want %q", ce.Code, CodeBadFuncArity)
+			}
+		})
+	}
+}
+
+// TestCompiler_LookupJSONString_BadArgType pins CodeBadFuncArgType. Both
+// arguments are declared as KindString; an Int field is rejected.
+func TestCompiler_LookupJSONString_BadArgType(t *testing.T) {
+	ce := compileErr(t, `lookup_json_string(http.uri, http.status)`, wafScheme(t))
+	if ce.Code != CodeBadFuncArgType {
+		t.Errorf("got Code %q, want %q", ce.Code, CodeBadFuncArgType)
+	}
+}
+
+// TestEval_D3_LookupJSONString covers the hit/miss paths:
+//   - hit with string value
+//   - miss (key absent) → ""
+//   - invalid JSON → ""
+//   - empty JSON → ""
+//   - empty key → ""
+//   - non-string value (number, bool, null) — converted via fmt.Sprint
+//   - whitespace-padded JSON
+//   - multiple keys — only the requested one is returned
+//
+// The key argument is a literal string (not a field reference) so the test
+// does not depend on a second scheme field.
+func TestEval_D3_LookupJSONString(t *testing.T) {
+	type tc struct {
+		name, src, in, want string
+	}
+	cases := []tc{
+		{"hit_string", `lookup_json_string(http.uri, "method") eq "GET"`, `{"method":"GET"}`, "GET"},
+		{"miss_key", `lookup_json_string(http.uri, "uri") eq ""`, `{"method":"GET"}`, ""},
+		{"invalid_json", `lookup_json_string(http.uri, "method") eq ""`, `not json`, ""},
+		{"empty_json", `lookup_json_string(http.uri, "method") eq ""`, ``, ""},
+		{"empty_key", `lookup_json_string(http.uri, "") eq ""`, `{"method":"GET"}`, ""},
+		// Non-string values are converted via fmt.Sprint: the function contract
+		// is "always return a string", so 42 → "42", true → "true", null → "<nil>".
+		{"number_value", `lookup_json_string(http.uri, "count") eq "42"`, `{"count":42}`, "42"},
+		{"bool_value_true", `lookup_json_string(http.uri, "flag") eq "true"`, `{"flag":true}`, "true"},
+		{"bool_value_false", `lookup_json_string(http.uri, "flag") eq "false"`, `{"flag":false}`, "false"},
+		// JSON whitespace handling: leading/trailing whitespace is permitted.
+		{"padded_json", `lookup_json_string(http.uri, "method") eq "GET"`, `  {"method":"GET"}  `, "GET"},
+		// Multiple keys — only the requested one is returned.
+		{"multi_key", `lookup_json_string(http.uri, "status") eq "200"`, `{"method":"GET","status":200}`, "200"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evalFuncString(t, c.src, c.want, map[string]rule.Value{
+				"http.uri": rule.NewString(c.in),
+			})
+		})
+	}
+}
+
+// TestEval_D3_LookupJSONString_LiteralArg covers the case where the json arg
+// itself is a literal rather than a field reference — exercises the value-
+// position path through opLitString on the json slot.
+func TestEval_D3_LookupJSONString_LiteralArg(t *testing.T) {
+	scheme := evalWafScheme(t)
+	ev := fixedEvent()
+	src := `lookup_json_string("{\"k\":\"v\"}", "k") eq "v"`
+	p := evalCompileOK(t, src, scheme)
+	r := &mapResolver{}
+	if !p.Eval(r, ev) {
+		t.Errorf("literal-json arg eval returned false")
+	}
+}
+
 // ========================== Helpers ==========================================================
 
 // (parser is imported for direct Parse calls in the per-function tests if a

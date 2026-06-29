@@ -100,6 +100,13 @@ func evalWafScheme(t *testing.T) *rule.Scheme {
 	mustEvalRegister(t, cat, "http", "ua", rule.TypeString)
 	mustEvalRegister(t, cat, "http", "body", rule.TypeBytes)
 	mustEvalRegister(t, cat, "http", "headers", rule.TypeMap)
+	// http.pattern is a runtime-supplied regex pattern used by tests that
+	// exercise the non-literal-pattern path of regex_replace. The field is
+	// TypeString so the per-arg Kind check (KindString) succeeds and the
+	// evaluator compiles the pattern per call (DECISION D4 non-literal
+	// fallback). Production schemes do not need this field; it lives here
+	// for test surface coverage.
+	mustEvalRegister(t, cat, "http", "pattern", rule.TypeString)
 	mustEvalRegister(t, cat, "custom", "flag", rule.TypeBool)
 	return cat.Project("core", "http", "custom")
 }

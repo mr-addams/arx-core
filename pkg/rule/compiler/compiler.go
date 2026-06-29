@@ -302,6 +302,31 @@ type opFunc struct {
 
 func (o *opFunc) kind() opKind { return kFunc }
 
+// opRegexReplace is the compiled shape of `regex_replace(s, pattern, repl)`.
+// It is a special case of opFunc: when the pattern argument is a literal
+// string, the compiler precompiles the regex (D4 — no regexp.Compile per
+// eval) and stores the *regexp.Regexp on the op. When the pattern is
+// non-literal (a field reference, a function call, etc.), compiled is nil
+// and the evaluator compiles per call — slower, but the only way to honour
+// a runtime-supplied pattern.
+//
+// subject and repl are always resolved at eval time (they almost always
+// reference fields). patternOp is the compile-time compiled op for the
+// pattern; it is unused when compiled != nil but is retained so the
+// evaluator can recover the runtime pattern value for non-literal calls.
+// patternText is the literal pattern string when compiled != nil; otherwise
+// it is empty (the eval reads patternOp instead).
+type opRegexReplace struct {
+	pos         pos
+	subject     op
+	patternOp   op
+	patternText string // set only when compiled != nil
+	compiled    *regexp.Regexp
+	repl        op
+}
+
+func (o *opRegexReplace) kind() opKind { return kFunc } // shares dispatch tag with opFunc
+
 // ========================== Logic ops =======================================================
 
 type opAnd struct {
@@ -716,6 +741,14 @@ func (c *Compiler) compileBracketAccess(nn *parser.BracketAccess) (op, *CompileE
 // The resolved spec is stored on the opFunc so the evaluator dispatches directly
 // to spec.Eval without re-looking-up the name or re-validating the signature.
 func (c *Compiler) compileFuncCall(nn *parser.FuncCall) (op, *CompileError) {
+	// regex_replace has a special compile path: when the pattern is a literal,
+	// the regex is precompiled at compile time (D4). The non-literal fallback
+	// re-compiles per eval. The contract is the same as opFunc from the
+	// evaluator's perspective (the kind tag is shared); only the compile-time
+	// pre-processing differs.
+	if nn.Name == "regex_replace" {
+		return c.compileRegexReplace(nn)
+	}
 	// Resolve the function name in the registry first — a bad name is the most
 	// common error and short-circuits arg compilation (no point validating args
 	// for a function that doesn't exist).
@@ -729,24 +762,64 @@ func (c *Compiler) compileFuncCall(nn *parser.FuncCall) (op, *CompileError) {
 
 	// Arity check — comes before arg compilation so a wrong count is reported as
 	// CodeBadFuncArity, not as a confusing downstream type error.
-	if len(nn.Args) != len(spec.ParamKinds) {
+	//
+	// For non-variadic functions: arity must equal len(ParamKinds).
+	// For variadic functions: arity must be at least len(ParamKinds)-1 (the
+	// last ParamKinds slot is the per-arg kind of every variadic argument
+	// beyond the minimum prefix). A variadic with one ParamKinds element
+	// accepts zero or more arguments.
+	//
+	// Defensive: a variadic registration with len(ParamKinds) == 0 is a
+	// programmer error — the per-arg kind slot does not exist. registerFunc
+	// does not enforce this directly because the v0.3.0 set is hand-rolled,
+	// but a future change should add the check at registration time. For now
+	// we guard the per-arg Kind computation against the empty slice.
+	minArity := len(spec.ParamKinds)
+	if spec.IsVariadic {
+		minArity = len(spec.ParamKinds) - 1
+		if minArity < 0 {
+			minArity = 0
+		}
+	}
+	if !spec.IsVariadic && len(nn.Args) != len(spec.ParamKinds) {
 		return nil, &CompileError{
 			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
 			Message: fmt.Sprintf("function %q expects %d argument(s), got %d", nn.Name, len(spec.ParamKinds), len(nn.Args)),
+		}
+	}
+	if spec.IsVariadic && len(nn.Args) < minArity {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function %q expects at least %d argument(s), got %d", nn.Name, minArity, len(nn.Args)),
 		}
 	}
 
 	// Compile args and check per-argument Kind against the declared ParamKinds.
 	// KindInvalid in ParamKinds acts as "any" — the argument's Kind is accepted
 	// unconditionally. For every other declared Kind the argument's compile-time
-	// Kind must match exactly.
+	// Kind must match exactly. For variadic functions, the LAST ParamKinds slot
+	// is the per-arg kind of every variadic argument beyond the minimum prefix.
 	args := make([]op, 0, len(nn.Args))
+	if spec.IsVariadic && len(spec.ParamKinds) == 0 {
+		// Defensive — see the arity-check comment above. A registered variadic
+		// function with no ParamKinds cannot meaningfully type-check its args;
+		// surface as CodeBadFuncArity so the operator sees a clear diagnostic.
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function %q is registered as variadic with no ParamKinds", nn.Name),
+		}
+	}
 	for i, a := range nn.Args {
 		compiled, err := c.compileNode(a)
 		if err != nil {
 			return nil, err
 		}
-		want := spec.ParamKinds[i]
+		var want rule.Kind
+		if spec.IsVariadic && i >= len(spec.ParamKinds)-1 {
+			want = spec.ParamKinds[len(spec.ParamKinds)-1]
+		} else {
+			want = spec.ParamKinds[i]
+		}
 		got := c.nodeKind(compiled)
 		if want != rule.KindInvalid && got != want {
 			return nil, &CompileError{
@@ -761,6 +834,84 @@ func (c *Compiler) compileFuncCall(nn *parser.FuncCall) (op, *CompileError) {
 }
 
 // ========================== Logic ops =======================================================
+
+// compileRegexReplace compiles `regex_replace(subject, pattern, repl)`. The
+// first two args share the standard compile-time signature check via
+// Lookup("regex_replace") — arity, per-arg Kind. The pattern, when a literal
+// string, is precompiled to *regexp.Regexp at compile time (D4 — no
+// regexp.Compile per eval). A non-literal pattern is stored as-is and
+// compiled per-eval by the evaluator.
+//
+// Errors:
+//   - CodeUnknownFunction: "regex_replace" is not in the registry (the name
+//     was renamed or removed in this build).
+//   - CodeBadFuncArity: arity != 3.
+//   - CodeBadFuncArgType: per-arg Kind mismatch.
+//   - CodeBadRegex: the literal pattern is not a valid RE2 regex.
+func (c *Compiler) compileRegexReplace(nn *parser.FuncCall) (op, *CompileError) {
+	spec, ok := Lookup("regex_replace")
+	if !ok {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeUnknownFunction,
+			Message: "function \"regex_replace\" is not in the function table",
+		}
+	}
+	if len(nn.Args) != len(spec.ParamKinds) {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function \"regex_replace\" expects %d argument(s), got %d", len(spec.ParamKinds), len(nn.Args)),
+		}
+	}
+	// Compile args + per-arg Kind check.
+	subjectOp, err := c.compileNode(nn.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(subjectOp) != rule.KindString {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"regex_replace\" argument 1: expected string, got %s", c.nodeKind(subjectOp)),
+		}
+	}
+	patternOp, err := c.compileNode(nn.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(patternOp) != rule.KindString {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"regex_replace\" argument 2: expected string, got %s", c.nodeKind(patternOp)),
+		}
+	}
+	replOp, err := c.compileNode(nn.Args[2])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(replOp) != rule.KindString {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"regex_replace\" argument 3: expected string, got %s", c.nodeKind(replOp)),
+		}
+	}
+
+	// Literal fast-path: precompile the pattern at compile time.
+	out := &opRegexReplace{pos: posOf(nn), subject: subjectOp, patternOp: patternOp, repl: replOp}
+	if lit, ok := patternOp.(*opLitString); ok {
+		pattern, _ := lit.v.AsString()
+		re, rerr := regexp.Compile(pattern)
+		if rerr != nil {
+			return nil, &CompileError{
+				Line: nn.Line, Col: nn.Col, Code: CodeBadRegex,
+				Message: fmt.Sprintf("invalid regex pattern %q: %s", pattern, rerr.Error()),
+			}
+		}
+		out.patternText = pattern
+		out.compiled = re
+	}
+	// Non-literal fallback: patternOp is set, compiled is nil. The evaluator
+	// resolves patternOp to a Value per call and compiles a regex on the fly.
+	return out, nil
+}
 
 func (c *Compiler) compileAnd(nn *parser.And) (op, *CompileError) {
 	left, err := c.compileNode(nn.Left)
@@ -998,6 +1149,10 @@ func (c *Compiler) nodeKind(o op) rule.Kind {
 		// populated by compileFuncCall at compile time, so downstream operators
 		// and comparisons type-check against the function's actual return.
 		return n.spec.ReturnKind
+	case *opRegexReplace:
+		// regex_replace always returns a string. The op shares the kind tag
+		// with opFunc (kFunc) but does not carry a FuncSpec.
+		return rule.KindString
 	}
 	return rule.KindInvalid
 }

@@ -193,6 +193,12 @@ func eval(o op, resolver rule.FieldResolver, event *plugin.Event) bool {
 	// ── Function call — dispatch via the registry (DECISION D16) ──────────────
 	case *opFunc:
 		return evalFuncCall(n, resolver, event)
+	case *opRegexReplace:
+		// The compile-time-precompiled regex path. If compiled is non-nil we
+		// honour DECISION D4 (no regexp.Compile per eval); the literal-pattern
+		// branch of compileRegexReplace populates this field. The non-literal
+		// branch leaves compiled nil and the evaluator compiles per call.
+		return evalRegexReplace(n, resolver, event)
 	}
 	// Unreachable for any Plan produced by the compiler (every concrete op type
 	// is handled above). Defensive false.
@@ -591,6 +597,66 @@ func evalFuncCallValue(n *opFunc, resolver rule.FieldResolver, event *plugin.Eve
 	return n.spec.Eval(args), true
 }
 
+// evalRegexReplace is the predicate-position dispatch for *opRegexReplace. The
+// function returns a string, so a predicate-position call (the function at the
+// root of a Plan) is a misuse. The engine's defensive contract surfaces this
+// as "no match" — same as every other op with the wrong return kind at root.
+//
+// We keep the function for symmetry with evalFuncCall; the value-returning
+// counterpart below is what value-position call sites use.
+func evalRegexReplace(n *opRegexReplace, resolver rule.FieldResolver, event *plugin.Event) bool {
+	v, ok := evalRegexReplaceValue(n, resolver, event)
+	if !ok {
+		return false
+	}
+	b, ok := v.AsBool()
+	if !ok {
+		return false
+	}
+	return b
+}
+
+// evalRegexReplaceValue resolves subject, repl, and (when the pattern was not
+// precompiled) the pattern itself, then performs the replacement.
+//
+// DECISION D4 fast path: when n.compiled is non-nil, the regex is reused across
+// every Eval call — no per-eval regexp.Compile. This is the case for literal
+// patterns and the dominant case for compiled Plans.
+//
+// Non-literal patterns compile per call (regexp.Compile on a runtime-
+// supplied string). The function Eval signature returns a Value, not an error,
+// so a malformed per-eval pattern surfaces as the subject unchanged — the same
+// defensive contract as the registry entry's evalRegexReplaceFallback.
+func evalRegexReplaceValue(n *opRegexReplace, resolver rule.FieldResolver, event *plugin.Event) (rule.Value, bool) {
+	subjectV, ok := evalValue(n.subject, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	subject, _ := subjectV.AsString()
+
+	replV, ok := evalValue(n.repl, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	repl, _ := replV.AsString()
+
+	if n.compiled != nil {
+		return rule.NewString(n.compiled.ReplaceAllString(subject, repl)), true
+	}
+
+	// Non-literal pattern: compile per call from the resolved pattern value.
+	patternV, ok := evalValue(n.patternOp, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	pattern, _ := patternV.AsString()
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return rule.NewString(subject), true
+	}
+	return rule.NewString(re.ReplaceAllString(subject, repl)), true
+}
+
 // evalValue walks an op and returns the Value it produces, plus an "ok" flag.
 // Used by the comparison / string / In ops to get the operand values, and by
 // evalFuncCallValue to resolve function arguments.
@@ -649,6 +715,13 @@ func evalValue(o op, resolver rule.FieldResolver, event *plugin.Event) (rule.Val
 	// ── Function call — resolve args and dispatch via the spec (D16) ───────────
 	case *opFunc:
 		return evalFuncCallValue(n, resolver, event)
+
+	// ── regex_replace — value-position (Group D3) ─────────────────────────────
+	case *opRegexReplace:
+		// Returns a string. The eval-side resolution of subject / repl / pattern
+		// (for non-literal patterns) lives in evalRegexReplace. We can reuse it
+		// here because its value-returning shape matches.
+		return evalRegexReplaceValue(n, resolver, event)
 
 	// ── Defensive — predicate ops are not Values ───────────────────────────────
 	case *opLitArray, *opAnd, *opOr, *opNot, *opCmp,
