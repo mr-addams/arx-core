@@ -335,8 +335,8 @@ func TestEqual(t *testing.T) {
 	})
 
 	t.Run("ip_4_vs_16_byte", func(t *testing.T) {
-		v4 := net.ParseIP("192.0.2.1").To4()           // 4-byte form
-		v16 := net.ParseIP("192.0.2.1")                // 16-byte form (::ffff:192.0.2.1)
+		v4 := net.ParseIP("192.0.2.1").To4() // 4-byte form
+		v16 := net.ParseIP("192.0.2.1")      // 16-byte form (::ffff:192.0.2.1)
 		if !NewIP(v4).Equal(NewIP(v16)) {
 			t.Fatalf("IPv4 4-byte form must equal 16-byte form for same address")
 		}
