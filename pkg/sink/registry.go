@@ -53,12 +53,12 @@ import (
 //
 // This type is independent of internal/config to avoid import cycles.
 type SinkConfig struct {
-	Type      string          // "file", "stdout", "sentinel-threat", etc.
-	Name      string          // for type="sentinel-threat"; named channel binding
-	Path      string          // for type="file"; ignored for others
-	Format    string          // "fail2ban", "json", etc. — product hint.
+	Type      string           // "file", "stdout", "sentinel-threat", etc.
+	Name      string           // for type="sentinel-threat"; named channel binding
+	Path      string           // for type="file"; ignored for others
+	Format    string           // "fail2ban", "json", etc. — product hint.
 	Formatter format.Formatter // injected by product code; sinks read this, not Format.
-	Exec      string          // path to exec plugin binary; used when type="exec"
+	Exec      string           // path to exec plugin binary; used when type="exec"
 }
 
 // Factory — constructor function for a named sink.
