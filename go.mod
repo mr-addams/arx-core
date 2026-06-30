@@ -7,6 +7,7 @@ require (
 	github.com/redis/go-redis/v9 v9.20.1
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/bbolt v1.5.0
+	google.golang.org/protobuf v1.36.11
 )
 
 require (

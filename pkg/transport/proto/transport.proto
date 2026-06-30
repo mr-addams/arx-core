@@ -1,0 +1,286 @@
+// Package proto holds the wire-format schema and generated code for the
+// sentinel transport (DECISION D27).
+//
+// The schema is the source of truth for the on-wire protocol; the generated
+// .pb.go file is committed to the repo so a clean checkout builds without
+// protoc. Regeneration is via `go generate ./pkg/transport/...` (see
+// protocol.go's //go:generate directive) or directly with protoc against this
+// file.
+//
+// Versioning: every Frame carries protocol_version. v0.1.0 frames use
+// protocol_version = 1. A node that receives an unsupported version drops
+// the frame and logs at WARN (D27 §3). The wire format itself is closed for
+// v0.1.0 (D29): adding message types requires a flow and a protocol_version
+// bump, not a silent schema edit.
+//
+// Message types are grouped by their natural stream (D27 §2):
+//   - Telemetry stream (uni, high-frequency, fire-and-forget): Heartbeat,
+//     TelemetryBatch, Alert.
+//   - Control stream (bi, request/response, low-frequency, ordered): Ping,
+//     Pong, RuleUpdate, RuleUpdateAck.
+//
+// "IANA: user-agent" for the wire format is intentionally not declared —
+// v0.1.0 is an internal sentinel-to-sentinel protocol with no IANA
+// registration. Field numbers are part of the on-wire contract and must not
+// be reshuffled without a version bump.
+syntax = "proto3";
+
+package arx.transport.v1;
+
+option go_package = "github.com/mr-addams/arx-core/pkg/transport/proto";
+
+// Frame is the top-level on-wire envelope sent over both telemetry and
+// control streams.
+//
+// Every Frame carries a protocol_version so a future node can drop unknown
+// versions cleanly. The body is a oneof: a Frame holds exactly ONE message
+// at a time. The protobuf encoding of a oneof is a tag-pointer (NOT a
+// fixed tag space) so adding a new variant in a future protocol_version is
+// non-breaking on the encode side — receivers of an older version will see
+// an unknown field-number and fall through to the drop-on-mismatch path
+// (D27 §3).
+message Frame {
+  // protocol_version is 1 for v0.1.0. Bumped when a new variant is added
+  // to Frame.body or when an existing message's semantics change.
+  // Field 1 is RESERVED FOR protocol_version in every future version.
+  uint32 protocol_version = 1;
+
+  // body holds the per-message payload. Exactly one field is set.
+  oneof body {
+    Heartbeat heartbeat = 10;
+    TelemetryBatch telemetry_batch = 11;
+    Alert alert = 12;
+    Ping ping = 20;
+    Pong pong = 21;
+    RuleUpdate rule_update = 22;
+    RuleUpdateAck rule_update_ack = 23;
+  }
+}
+
+// Heartbeat is a periodic liveness beacon sent on a unidirectional telemetry
+// stream.
+//
+// Rationale: the smallest possible telemetry primitive — "this node is
+// alive and running this protocol_version". Operators read heartbeat gaps
+// to spot dead peers. Frequencies are NOT encoded in the message (a peer
+// sends a heartbeat every N seconds; N is an operator concern, not a wire
+// concern — D25).
+message Heartbeat {
+  // sender_node_id is the sending node's identity fingerprint, in the
+  // "sha256:<hex>" form used everywhere in the transport (D23, D24). The
+  // receiver does not need to trust it — the TLS handshake already pinned
+  // the peer's identity — but carrying it lets operators grep logs and
+  // correlate frames to nodes without re-deriving the fingerprint from the
+  // QUIC connection.
+  string sender_node_id = 1;
+
+  // monotonic_clock_ms is the sender's monotonic clock at send time, in
+  // milliseconds. The receiver does NOT interpret this as wall-clock time;
+  // it is purely a delta measurement aid (heartbeat age = now - this).
+  // Monotonic, not time.Now(), because wall clocks can jump backwards and
+  // make the heartbeat-age math lie.
+  uint64 monotonic_clock_ms = 2;
+}
+
+// TelemetryBatch is a single frame carrying N metric samples.
+//
+// Rationale: Heartbeat is "alive"; TelemetryBatch is "doing well". A single
+// per-second batch is dramatically cheaper on the wire than N separate
+// frames (one Protobuf envelope, one UDP datagram, one TLS record), and
+// sentinel nodes generate a small fixed set of metrics (counters for
+// rules evaluated, alerts emitted, etc.) at a steady rate.
+//
+// Each sample is a tagged (name, type, value) triple. v0.1.0 supports
+// counter and gauge; other metric types (histogram, summary) are
+// deferred — adding a new MetricType enum value is a non-breaking change
+// in proto3 (unknown enum values are dropped, not rejected), so a future
+// version can extend the set without a version bump.
+message TelemetryBatch {
+  // sender_node_id follows the same convention as Heartbeat.
+  string sender_node_id = 1;
+
+  // monotonic_clock_ms is the batch's send-time, in the same convention
+  // as Heartbeat.
+  uint64 monotonic_clock_ms = 2;
+
+  // samples are the per-metric values in this batch. A batch MAY be empty
+  // (no samples) — that is a legal "nothing to report" frame.
+  repeated MetricSample samples = 3;
+}
+
+// MetricSample is one name + typed value pair inside a TelemetryBatch.
+message MetricSample {
+  // name is the metric name. v0.1.0 names are operator-defined strings;
+  // the transport does not interpret them. A future version may declare
+  // a canonical name registry.
+  string name = 1;
+
+  // type selects the interpretation of value. Unknown types at the
+  // receiver are dropped (per proto3 enum rules) without rejecting the
+  // whole batch.
+  MetricType type = 2;
+
+  // value is the metric's value. Interpretation depends on type:
+  //   COUNTER_UNSPECIFIED / GAUGE: the integer reading at sample time.
+  // The unit is metric-name-defined (operators agree on "rules_evaluated"
+  // being a count, "cpu_usage_pct" being a percentage). The wire format
+  // does not carry units.
+  uint64 value = 3;
+}
+
+// MetricType identifies how a MetricSample.value should be interpreted.
+enum MetricType {
+  COUNTER_UNSPECIFIED = 0;  // proto3 default; same wire as COUNTER.
+  COUNTER = 1;              // Monotonically increasing cumulative value.
+  GAUGE = 2;                // Point-in-time snapshot.
+}
+
+// Alert is a security event forwarded from a leaf node to a coordinator
+// or hub (D25: hub-spoke and hierarchical topologies are first-class).
+//
+// Rationale: the sentinel product's reason for existing is to detect and
+// surface events. The transport MUST carry alerts even in v0.1.0;
+// deferring this to a later flow would make the transport package
+// structurally incomplete (it could move bytes but not the actual
+// product payload). The alert is sent on a telemetry stream (uni,
+// fire-and-forget) — alerts are not acknowledged at the transport level
+// in v0.1.0; dedup / ack is a higher-level concern.
+//
+// The rule_id and severity fields let the receiver route the alert
+// without inspecting payload bytes. payload is opaque to the transport
+// and is the arxsentinel product's responsibility to format (D30: alert
+// schema is product-side, not arx-core).
+message Alert {
+  // sender_node_id follows the same convention as Heartbeat.
+  string sender_node_id = 1;
+
+  // monotonic_clock_ms is the alert's send-time.
+  uint64 monotonic_clock_ms = 2;
+
+  // rule_id identifies which rule fired. v0.1.0 carries the raw ID
+  // string; a future version may declare a typed ID.
+  string rule_id = 3;
+
+  // severity is the alert's severity. proto3 enum rules apply: unknown
+  // values are dropped at the receiver without rejecting the frame.
+  AlertSeverity severity = 4;
+
+  // payload is the alert's body, opaque to the transport layer. The
+  // arxsentinel product defines the encoding; arx-core does not parse it.
+  bytes payload = 5;
+}
+
+// AlertSeverity is the alert's severity bucket. v0.1.0 ships a small,
+// stable set; future versions may add levels without a version bump
+// (proto3 enums are forward-compatible).
+enum AlertSeverity {
+  INFO_UNSPECIFIED = 0;  // proto3 default; same wire as INFO.
+  INFO = 1;
+  WARNING = 2;
+  CRITICAL = 3;
+}
+
+// Ping is a liveness probe sent from one peer to another on a
+// bidirectional control stream. The receiver MUST answer with a Pong
+// carrying the same nonce.
+//
+// Rationale: Heartbeat is asynchronous, uni-directional, and
+// "best-effort" (a dropped heartbeat looks like a slow peer). Ping/Pong
+// is synchronous, request/response, and gives the sender a concrete
+// round-trip-time measurement for diagnostics ("operator runs ping, gets
+// back 42ms, knows the link is healthy"). It uses a different stream
+// type (control, not telemetry) because control streams are ordered and
+// loss-recovered by QUIC — telemetry streams are not.
+//
+// nonce is a random 8-byte value chosen by the sender. The receiver
+// echoes it back in Pong so the sender can match requests to responses
+// (a peer may have multiple in-flight pings).
+message Ping {
+  // nonce is a sender-chosen random identifier for matching the Pong.
+  bytes nonce = 1;
+
+  // monotonic_clock_ms is the sender's monotonic clock at send time.
+  uint64 monotonic_clock_ms = 2;
+}
+
+// Pong is the response to a Ping. The nonce MUST equal the Ping's nonce.
+//
+// Rationale: see Ping. Pong carries the original nonce plus the
+// receiver's clock so the sender can compute the round-trip time:
+//   rtt_ms = receiver_monotonic_clock_ms - sender_monotonic_clock_ms.
+//
+// monotonic_clock values are NOT comparable across nodes (each node's
+// monotonic clock starts at boot, not at epoch). The sender uses the
+// value in Ping (own clock) and the value in Pong (peer's clock) to
+// derive rtt — see PROTOCOL.md for the full timing math.
+message Pong {
+  // nonce is the Ping's nonce, echoed.
+  bytes nonce = 1;
+
+  // receiver_monotonic_clock_ms is the receiver's monotonic clock at
+  // Pong send time. See Pong.rationale for the rtt derivation.
+  uint64 receiver_monotonic_clock_ms = 2;
+}
+
+// RuleUpdate is a control-stream message that asks the receiver to apply
+// a new or modified rule.
+//
+// Rationale: "control" in the transport's name means coordinated
+// behaviour across the mesh. The single control-plane primitive in
+// v0.1.0 is rule distribution — a coordinator publishes a rule change,
+// followers apply it. There is no in-band revoke in v0.1.0 (D24: rule
+// lifecycle is product-side, not transport-side); a future version can
+// add RuleRevoke as a new Frame.body variant without breaking v0.1.0
+// decoders.
+//
+// sender_node_id lets the receiver log who published the change.
+// payload carries the rule definition. v0.1.0 does NOT define a rule
+// schema on the wire — payload is opaque to the transport and is the
+// arxsentinel product's concern (D30: rules are product-side). The
+// transport only guarantees: this message was sent by a peer that
+// completed the TOFU handshake.
+message RuleUpdate {
+  // sender_node_id follows the same convention as Heartbeat.
+  string sender_node_id = 1;
+
+  // rule_id identifies which rule this update targets. v0.1.0 carries
+  // the raw ID; a future version may declare a typed ID.
+  string rule_id = 2;
+
+  // payload is the new rule definition, opaque to the transport layer.
+  // The arxsentinel product defines the encoding.
+  bytes payload = 3;
+}
+
+// RuleUpdateAck is the receiver's confirmation that a RuleUpdate was
+// applied (or rejected, with a reason).
+//
+// Rationale: without an ack, the rule publisher cannot distinguish
+// "delivered but not yet applied" from "delivered and applied" from
+// "never delivered". A coordinator that re-publishes a rule without an
+// ack ends up either spamming followers (no ack → republish loop) or
+// never noticing a rule was rejected (no failure signal). The ack
+// closes the loop at the transport level; the product layer above
+// decides what to do with a rejected ack.
+//
+// status discriminates success/failure and carries a reason on failure.
+// The receiver MUST send exactly one Ack per accepted RuleUpdate.
+message RuleUpdateAck {
+  // rule_id identifies which RuleUpdate this ack corresponds to.
+  string rule_id = 1;
+
+  // status is the application outcome. Unknown statuses are dropped at
+  // the receiver without rejecting the frame (proto3 enum rule).
+  AckStatus status = 2;
+
+  // reason is a free-form human-readable explanation. Set on REJECTED;
+  // empty on APPLIED. The transport does not interpret this field.
+  string reason = 3;
+}
+
+// AckStatus is the outcome of a RuleUpdate.
+enum AckStatus {
+  APPLIED_UNSPECIFIED = 0;  // proto3 default; same wire as APPLIED.
+  APPLIED = 1;              // Rule was successfully applied.
+  REJECTED = 2;             // Rule was rejected; see RuleUpdateAck.reason.
+}
