@@ -18,7 +18,7 @@ self-contained building block — composing many of them is what makes it
 possible to build distributed telemetry collection and processing networks.
 
 arx-core originated as the pipeline core of ArxSentinel and was extracted into
-a standalone module. ArxSentinel is now simply its first consumer: product-
+a standalone module. ArxSentinel `https://github.com/mr-addams/arxsentinel` is now simply its first consumer: product-
 specific logic — security scoring, threat intelligence, vendor integrations —
 lives in that product layer and reaches arx-core only through the public
 runtime contract. Nothing in the core is tied to that origin.
