@@ -174,9 +174,9 @@ type Value struct {
 	ip  net.IP  // KindIP — always a freshly-copied []byte, never shared with caller
 
 	// Heap-backed storage — only meaningful for their respective Kinds.
-	bytes []byte       // KindBytes
-	ts    time.Time    // KindTimestamp
-	arr   []Value      // KindArray
+	bytes []byte           // KindBytes
+	ts    time.Time        // KindTimestamp
+	arr   []Value          // KindArray
 	m     map[string]Value // KindMap
 }
 

@@ -41,6 +41,18 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # gofmt gate: fail the build if any file is not gofmt-formatted.
+      # Added in Flow 002 after a review found committed files that were
+      # not gofmt-clean (CI did not previously enforce formatting).
+      - name: gofmt check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
   # ── 2. Race-тесты (модульный прогон, без build-тегов) ────────────────────
   # Запускаем только тесты, доступные без build-тега `integration` —
   # это unit-тесты в pkg/executor/queue/ (bbolt_test.go, redis_test.go,

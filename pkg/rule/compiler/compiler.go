@@ -35,10 +35,10 @@
 //       package). The compiler produces the typed plan; the evaluator executes it.
 //     - Implicit type coercion (DECISION D14 / D15): v1 is strict-typed. The only
 //       special case is IP `eq` CIDR / IP `in` [CIDR...] on the right operand.
-//     - Function implementations (DECISION D14): v1 has a closed, EMPTY function
-//       table. Every FuncCall is rejected with `unknown_function`. The function
-//       registry is wired up (so future flows can add entries by listing them in
-//       one place) but no entry exists in v1.
+//     - Function implementations (DECISION D16): the v0.3.0 function table is
+//       a closed, package-internal registry (functions.go); compile-time signature
+//       checking rejects unknown names, wrong arity, and per-argument Kind
+//       mismatches before eval is reached.
 //     - Parser / lexer (Group B). The compiler consumes parser.Node values only.
 //     - Map-key validation (DECISION D11). Map keys are eval-time resolved.
 //
@@ -175,6 +175,7 @@ const (
 	kMatches
 	kWildcard
 	kIn
+	kBitAnd
 	kStrict
 )
 
@@ -218,13 +219,17 @@ type opLitBool struct {
 func (o *opLitBool) kind() opKind { return kLitBool }
 
 // opLitIP carries a KindIP Value plus the CIDR distinction. For non-CIDR, mask == 0
-// and the evaluator performs plain IP equality. For CIDR, mask is the prefix length
-// (0..32 for IPv4, 0..128 for IPv6) and the evaluator performs CIDR membership.
+// and ipnet is nil; the evaluator performs plain IP equality. For CIDR, mask is the
+// prefix length (0..32 for IPv4, 0..128 for IPv6) and ipnet is the *net.IPNet parsed
+// ONCE at compile time — the evaluator calls ipnet.Contains(left) directly with no
+// runtime ParseCIDR on the hot path (DECISION D17). Invariant: cidr==false ⇒ ipnet
+// nil; cidr==true ⇒ ipnet non-nil (compileLitIP populates it).
 type opLitIP struct {
-	pos  pos
-	v    rule.Value
-	cidr bool
-	mask int // 0 for plain IP, otherwise prefix length
+	pos   pos
+	v     rule.Value
+	cidr  bool
+	mask  int        // 0 for plain IP, otherwise prefix length
+	ipnet *net.IPNet // non-nil iff cidr==true; pre-resolved at compile time
 }
 
 func (o *opLitIP) kind() opKind { return kLitIP }
@@ -288,16 +293,62 @@ type opBracket struct {
 
 func (o *opBracket) kind() opKind { return kBracket }
 
-// opFunc is a function call. v1 has a closed EMPTY function table; every FuncCall
-// is rejected with CodeUnknownFunction. The struct is here so the evaluator's
-// future dispatch has a stable shape.
+// opFunc is a function call. The compiled op carries the function name, the
+// compiled argument ops, and the FuncSpec resolved at compile time (DECISION
+// D16 §2 — compile-time signature checking). The evaluator dispatches via
+// spec.Eval directly; it does not re-look-up the name or re-validate the
+// arity / argument Kinds.
 type opFunc struct {
 	pos  pos
 	name string
 	args []op
+	spec FuncSpec
 }
 
 func (o *opFunc) kind() opKind { return kFunc }
+
+// opRegexReplace is the compiled shape of `regex_replace(s, pattern, repl)`.
+// It is a special case of opFunc: when the pattern argument is a literal
+// string, the compiler precompiles the regex (D4 — no regexp.Compile per
+// eval) and stores the *regexp.Regexp on the op. When the pattern is
+// non-literal (a field reference, a function call, etc.), compiled is nil
+// and the evaluator compiles per call — slower, but the only way to honour
+// a runtime-supplied pattern.
+//
+// subject and repl are always resolved at eval time (they almost always
+// reference fields). patternOp is the compile-time compiled op for the
+// pattern; it is unused when compiled != nil but is retained so the
+// evaluator can recover the runtime pattern value for non-literal calls.
+// patternText is the literal pattern string when compiled != nil; otherwise
+// it is empty (the eval reads patternOp instead).
+type opRegexReplace struct {
+	pos         pos
+	subject     op
+	patternOp   op
+	patternText string // set only when compiled != nil
+	compiled    *regexp.Regexp
+	repl        op
+}
+
+func (o *opRegexReplace) kind() opKind { return kFunc } // shares dispatch tag with opFunc
+
+// opCIDRMatcher is the compiled shape of `cidr_matches(ip, cidr)`. It is a
+// special case of opFunc: when the cidr argument is a literal string, the
+// *net.IPNet is parsed ONCE at compile time (DECISION D17) and stored on the
+// op. When the cidr argument is non-literal, the evaluator parses it per call.
+//
+// The struct keeps the generic kFunc dispatch tag so the evaluator can treat it
+// alongside opFunc; the difference is only the compile-time pre-processing of
+// the CIDR string into a reusable *net.IPNet.
+type opCIDRMatcher struct {
+	pos      pos
+	ipArg    op
+	cidrArg  op
+	cidrText string // set only when cidrNet != nil
+	cidrNet  *net.IPNet
+}
+
+func (o *opCIDRMatcher) kind() opKind { return kFunc } // shares dispatch tag with opFunc
 
 // ========================== Logic ops =======================================================
 
@@ -380,15 +431,14 @@ type opWildcard struct {
 	left    op
 	pattern string // pre-validated literal string
 
-	// Изменение (Задача C2, evaluator): ленивая компиляция wildcard-паттерна в
-	// *regexp.Regexp. Компилятор (C1) НЕ компилирует regexp на этом этапе —
-	// compileWildcard остаётся без изменений (pattern валидируется как строка,
-	// не как regex). Эвалюатор компилирует паттерн при первом Eval через
-	// compileOnce, чтобы не платить за regexp.Compile на каждом Eval-вызове и
-	// при этом не делать compile-time compile (что потребовало бы расширения
-	// contract-стабильного C1 — sync.Once здесь держит compiler.go неизменным
-	// по поведению). Два новых поля additive: opWildcard неэкспортирован,
-	// публичный API не затронут.
+	// Change (Task C2, evaluator): lazy compilation of the wildcard pattern into
+	// a *regexp.Regexp. The compiler (C1) does NOT compile the regexp here —
+	// compileWildcard is unchanged (the pattern is validated as a string, not as
+	// a regex). The evaluator compiles the pattern on the first Eval via
+	// compileOnce, so we do not pay regexp.Compile on every Eval, and we avoid a
+	// compile-time compilation step (which would require extending the
+	// contract-stable C1 — sync.Once keeps compiler.go's behaviour unchanged).
+	// Two new fields added; opWildcard is unexported, public API untouched.
 	regex       *regexp.Regexp
 	compileOnce sync.Once
 }
@@ -411,6 +461,26 @@ type opStrict struct {
 }
 
 func (o *opStrict) kind() opKind { return kStrict }
+
+// ========================== BitAnd op (D19) ==================================================
+
+// opBitAnd is the compiled shape of the bytes bitmask-test operator (`&`).
+// Both operands must be KindBytes (compile-time type-checked). The runtime
+// semantics — for every byte position i, (value[i] & mask[i]) == mask[i] —
+// are recorded in DECISION D19.
+//
+// The op itself is alloc-free at eval time (the evaluator walks the two
+// operand slices in place). The compiled shape does not pre-resolve anything
+// per-operand; length checks and the per-byte AND test are both cheap enough
+// to defer to the evaluator's hot path, and centralising them there keeps
+// the per-byte contract identical between literal-literal and field-literal
+// operands.
+type opBitAnd struct {
+	pos         pos
+	left, right op // both must be KindBytes after compile
+}
+
+func (o *opBitAnd) kind() opKind { return kBitAnd }
 
 // ========================== Compiler ========================================================
 
@@ -535,6 +605,8 @@ func (c *Compiler) compileNode(n parser.Node) (op, *CompileError) {
 		return c.compileWildcard(nn)
 	case *parser.In:
 		return c.compileIn(nn)
+	case *parser.BitAnd:
+		return c.compileBitAnd(nn)
 	case *parser.Strict:
 		return c.compileStrict(nn)
 	default:
@@ -557,7 +629,8 @@ func posOf(n parser.Node) pos {
 
 // compileLitIP packages a parser LitIP into an opLitIP. The IsCIDR / mask pre-computation
 // lives here so the evaluator does not have to re-parse the IP / split the CIDR on the
-// hot path.
+// hot path. For CIDR literals the *net.IPNet is parsed ONCE here and stored on the op
+// (DECISION D17); eval calls ipnet.Contains(left) directly with no runtime ParseCIDR.
 func (c *Compiler) compileLitIP(nn *parser.LitIP) (op, *CompileError) {
 	if !nn.IsCIDR {
 		return &opLitIP{pos: posOf(nn), v: nn.Value, cidr: false, mask: 0}, nil
@@ -575,7 +648,7 @@ func (c *Compiler) compileLitIP(nn *parser.LitIP) (op, *CompileError) {
 		}
 	}
 	mask, _ := ipnet.Mask.Size()
-	return &opLitIP{pos: posOf(nn), v: nn.Value, cidr: true, mask: mask}, nil
+	return &opLitIP{pos: posOf(nn), v: nn.Value, cidr: true, mask: mask, ipnet: ipnet}, nil
 }
 
 // compileLitArray validates the array literal: every element must be a scalar literal.
@@ -696,30 +769,267 @@ func (c *Compiler) compileBracketAccess(nn *parser.BracketAccess) (op, *CompileE
 
 // ========================== Function calls ==================================================
 
-// compileFuncCall is the v1 stub. The function table is closed AND EMPTY (D14), so
-// every FuncCall is rejected with CodeUnknownFunction. The branch is here so a future
-// flow can populate the table by adding a single case statement — no further changes
-// to compileFuncCall's signature are required.
+// compileFuncCall resolves the function name against the registry, validates the
+// argument count and per-argument Kind against the registered FuncSpec, and emits an
+// opFunc carrying the resolved spec (DECISION D16 §2 — compile-time signature
+// checking).
+//
+// Errors:
+//   - CodeUnknownFunction: name is not in the registry.
+//   - CodeBadFuncArity: argument count does not match ParamKinds.
+//   - CodeBadFuncArgType: per-argument Kind does not match the declared ParamKinds.
+//
+// Note: a parameter declared as KindInvalid in the registry (e.g. to_string's
+// single "any" parameter) accepts any argument Kind. This is how to_string is
+// polymorphic without special-casing the compiler's per-argument check.
+//
+// The resolved spec is stored on the opFunc so the evaluator dispatches directly
+// to spec.Eval without re-looking-up the name or re-validating the signature.
 func (c *Compiler) compileFuncCall(nn *parser.FuncCall) (op, *CompileError) {
-	// Compile args eagerly so a bad type in the argument list surfaces here, not in
-	// some downstream op dispatch.
+	// regex_replace has a special compile path: when the pattern is a literal,
+	// the regex is precompiled at compile time (D4). The non-literal fallback
+	// re-compiles per eval. The contract is the same as opFunc from the
+	// evaluator's perspective (the kind tag is shared); only the compile-time
+	// pre-processing differs.
+	if nn.Name == "regex_replace" {
+		return c.compileRegexReplace(nn)
+	}
+	// cidr_matches has a special compile path mirroring regex_replace: when the
+	// cidr argument is a literal string, net.ParseCIDR runs once at compile time
+	// and the resulting *net.IPNet is stored on the op (DECISION D17). A non-
+	// literal cidr arg falls back to per-eval parsing. This special case is
+	// placed before the generic Lookup so the per-arg Kind checks and the literal
+	// fast path can share the same shape as compileRegexReplace.
+	if nn.Name == "cidr_matches" {
+		return c.compileCIDRMatcher(nn)
+	}
+	// Resolve the function name in the registry first — a bad name is the most
+	// common error and short-circuits arg compilation (no point validating args
+	// for a function that doesn't exist).
+	spec, ok := Lookup(nn.Name)
+	if !ok {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeUnknownFunction,
+			Message: fmt.Sprintf("function %q is not in the function table", nn.Name),
+		}
+	}
+
+	// Arity check — comes before arg compilation so a wrong count is reported as
+	// CodeBadFuncArity, not as a confusing downstream type error.
+	//
+	// For non-variadic functions: arity must equal len(ParamKinds).
+	// For variadic functions: arity must be at least len(ParamKinds)-1 (the
+	// last ParamKinds slot is the per-arg kind of every variadic argument
+	// beyond the minimum prefix). A variadic with one ParamKinds element
+	// accepts zero or more arguments.
+	//
+	// Defensive: a variadic registration with len(ParamKinds) == 0 is a
+	// programmer error — the per-arg kind slot does not exist. registerFunc
+	// does not enforce this directly because the v0.3.0 set is hand-rolled,
+	// but a future change should add the check at registration time. For now
+	// we guard the per-arg Kind computation against the empty slice.
+	minArity := len(spec.ParamKinds)
+	if spec.IsVariadic {
+		minArity = len(spec.ParamKinds) - 1
+		if minArity < 0 {
+			minArity = 0
+		}
+	}
+	if !spec.IsVariadic && len(nn.Args) != len(spec.ParamKinds) {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function %q expects %d argument(s), got %d", nn.Name, len(spec.ParamKinds), len(nn.Args)),
+		}
+	}
+	if spec.IsVariadic && len(nn.Args) < minArity {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function %q expects at least %d argument(s), got %d", nn.Name, minArity, len(nn.Args)),
+		}
+	}
+
+	// Compile args and check per-argument Kind against the declared ParamKinds.
+	// KindInvalid in ParamKinds acts as "any" — the argument's Kind is accepted
+	// unconditionally. For every other declared Kind the argument's compile-time
+	// Kind must match exactly. For variadic functions, the LAST ParamKinds slot
+	// is the per-arg kind of every variadic argument beyond the minimum prefix.
 	args := make([]op, 0, len(nn.Args))
-	for _, a := range nn.Args {
+	if spec.IsVariadic && len(spec.ParamKinds) == 0 {
+		// Defensive — see the arity-check comment above. A registered variadic
+		// function with no ParamKinds cannot meaningfully type-check its args;
+		// surface as CodeBadFuncArity so the operator sees a clear diagnostic.
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function %q is registered as variadic with no ParamKinds", nn.Name),
+		}
+	}
+	for i, a := range nn.Args {
 		compiled, err := c.compileNode(a)
 		if err != nil {
 			return nil, err
 		}
+		var want rule.Kind
+		if spec.IsVariadic && i >= len(spec.ParamKinds)-1 {
+			want = spec.ParamKinds[len(spec.ParamKinds)-1]
+		} else {
+			want = spec.ParamKinds[i]
+		}
+		got := c.nodeKind(compiled)
+		if want != rule.KindInvalid && got != want {
+			return nil, &CompileError{
+				Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+				Message: fmt.Sprintf("function %q argument %d: expected %s, got %s", nn.Name, i+1, want, got),
+			}
+		}
 		args = append(args, compiled)
 	}
 
-	// v1 function table — closed and empty. Any FuncCall is rejected. See D14.
-	return nil, &CompileError{
-		Line: nn.Line, Col: nn.Col, Code: CodeUnknownFunction,
-		Message: fmt.Sprintf("function %q is not in the v1 function table", nn.Name),
+	return &opFunc{pos: posOf(nn), name: nn.Name, args: args, spec: spec}, nil
+}
+
+// compileCIDRMatcher compiles `cidr_matches(ip, cidr)`. The first arg must be
+// KindIP and the second arg KindString. When the second arg is a literal
+// string, net.ParseCIDR is called once and the resulting *net.IPNet is stored
+// on the op. A non-literal cidr arg leaves cidrNet nil and the evaluator parses
+// per call.
+//
+// Errors:
+//   - CodeUnknownFunction: "cidr_matches" is not in the registry.
+//   - CodeBadFuncArity: arity != 2.
+//   - CodeBadFuncArgType: ip arg is not KindIP, or cidr arg is not KindString.
+//   - CodeInvalidLiteral: the literal cidr string is not a valid CIDR.
+func (c *Compiler) compileCIDRMatcher(nn *parser.FuncCall) (op, *CompileError) {
+	spec, ok := Lookup("cidr_matches")
+	if !ok {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeUnknownFunction,
+			Message: "function \"cidr_matches\" is not in the function table",
+		}
 	}
+	if len(nn.Args) != len(spec.ParamKinds) {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function \"cidr_matches\" expects %d argument(s), got %d", len(spec.ParamKinds), len(nn.Args)),
+		}
+	}
+
+	// Compile args + per-arg Kind check.
+	ipOp, err := c.compileNode(nn.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(ipOp) != rule.KindIP {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"cidr_matches\" argument 1: expected ip, got %s", c.nodeKind(ipOp)),
+		}
+	}
+	cidrOp, err := c.compileNode(nn.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(cidrOp) != rule.KindString {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"cidr_matches\" argument 2: expected string, got %s", c.nodeKind(cidrOp)),
+		}
+	}
+
+	out := &opCIDRMatcher{pos: posOf(nn), ipArg: ipOp, cidrArg: cidrOp}
+	if lit, ok := cidrOp.(*opLitString); ok {
+		cidrText, _ := lit.v.AsString()
+		_, ipnet, perr := net.ParseCIDR(cidrText)
+		if perr != nil {
+			return nil, &CompileError{
+				Line: nn.Line, Col: nn.Col, Code: CodeInvalidLiteral,
+				Message: fmt.Sprintf("invalid CIDR %q: %s", cidrText, perr.Error()),
+			}
+		}
+		out.cidrText = cidrText
+		out.cidrNet = ipnet
+	}
+	return out, nil
 }
 
 // ========================== Logic ops =======================================================
+
+// compileRegexReplace compiles `regex_replace(subject, pattern, repl)`. The
+// first two args share the standard compile-time signature check via
+// Lookup("regex_replace") — arity, per-arg Kind. The pattern, when a literal
+// string, is precompiled to *regexp.Regexp at compile time (D4 — no
+// regexp.Compile per eval). A non-literal pattern is stored as-is and
+// compiled per-eval by the evaluator.
+//
+// Errors:
+//   - CodeUnknownFunction: "regex_replace" is not in the registry (the name
+//     was renamed or removed in this build).
+//   - CodeBadFuncArity: arity != 3.
+//   - CodeBadFuncArgType: per-arg Kind mismatch.
+//   - CodeBadRegex: the literal pattern is not a valid RE2 regex.
+func (c *Compiler) compileRegexReplace(nn *parser.FuncCall) (op, *CompileError) {
+	spec, ok := Lookup("regex_replace")
+	if !ok {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeUnknownFunction,
+			Message: "function \"regex_replace\" is not in the function table",
+		}
+	}
+	if len(nn.Args) != len(spec.ParamKinds) {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function \"regex_replace\" expects %d argument(s), got %d", len(spec.ParamKinds), len(nn.Args)),
+		}
+	}
+	// Compile args + per-arg Kind check.
+	subjectOp, err := c.compileNode(nn.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(subjectOp) != rule.KindString {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"regex_replace\" argument 1: expected string, got %s", c.nodeKind(subjectOp)),
+		}
+	}
+	patternOp, err := c.compileNode(nn.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(patternOp) != rule.KindString {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"regex_replace\" argument 2: expected string, got %s", c.nodeKind(patternOp)),
+		}
+	}
+	replOp, err := c.compileNode(nn.Args[2])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(replOp) != rule.KindString {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"regex_replace\" argument 3: expected string, got %s", c.nodeKind(replOp)),
+		}
+	}
+
+	// Literal fast-path: precompile the pattern at compile time.
+	out := &opRegexReplace{pos: posOf(nn), subject: subjectOp, patternOp: patternOp, repl: replOp}
+	if lit, ok := patternOp.(*opLitString); ok {
+		pattern, _ := lit.v.AsString()
+		re, rerr := regexp.Compile(pattern)
+		if rerr != nil {
+			return nil, &CompileError{
+				Line: nn.Line, Col: nn.Col, Code: CodeBadRegex,
+				Message: fmt.Sprintf("invalid regex pattern %q: %s", pattern, rerr.Error()),
+			}
+		}
+		out.patternText = pattern
+		out.compiled = re
+	}
+	// Non-literal fallback: patternOp is set, compiled is nil. The evaluator
+	// resolves patternOp to a Value per call and compiles a regex on the fly.
+	return out, nil
+}
 
 func (c *Compiler) compileAnd(nn *parser.And) (op, *CompileError) {
 	left, err := c.compileNode(nn.Left)
@@ -915,7 +1225,7 @@ func typeMismatchErr(src *parser.Cmp, format string, args ...any) *CompileError 
 // nodeKind extracts the underlying Value Kind from a plan op. For literal ops the
 // Kind is taken from the stored Value. For non-literal ops the Kind is what the
 // op WOULD produce at evaluation time: Bool for logic ops, Bool for the boolean-
-// returning operators, etc.
+// returning operators, the function's declared ReturnKind for opFunc, etc.
 //
 // This is a compile-time concept, not a runtime evaluation — it tells the type
 // checker what Kind each op has, so it can match against operator signatures.
@@ -950,19 +1260,39 @@ func (c *Compiler) nodeKind(o op) rule.Kind {
 		return rule.KindBool
 	case *opNot:
 		return rule.KindBool
-	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn, *opStrict:
+	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn, *opBitAnd, *opStrict:
 		return rule.KindBool
 	case *opFunc:
-		// v1: functions are all rejected, so this branch is unreachable in a
-		// successful compile. If a future flow registers functions, this is the
-		// place to consult the function table for its declared return Kind.
-		return rule.KindInvalid
+		// Return the function's declared return Kind (D16 §2). The spec is
+		// populated by compileFuncCall at compile time, so downstream operators
+		// and comparisons type-check against the function's actual return.
+		return n.spec.ReturnKind
+	case *opRegexReplace:
+		// regex_replace always returns a string. The op shares the kind tag
+		// with opFunc (kFunc) but does not carry a FuncSpec.
+		return rule.KindString
+	case *opCIDRMatcher:
+		// cidr_matches always returns a bool. The op shares the kind tag
+		// with opFunc (kFunc) but does not carry a FuncSpec; the explicit
+		// case here keeps the function's contract aligned with opFunc +
+		// opRegexReplace, so downstream operators type-check cidr_matches
+		// calls against KindBool (D16 §2).
+		return rule.KindBool
 	}
 	return rule.KindInvalid
 }
 
 // kindFromFieldType maps a Scheme FieldType to the runtime Kind it represents. The
 // mapping is the inverse of the FieldType constants in scheme.go.
+//
+// Intentional fall-through: an unmapped FieldType returns KindInvalid. The
+// TestKindFromFieldType_CoversAllFieldTypes test in compiler_test.go guards
+// completeness — it iterates every plugin.FieldType constant and fails the
+// build if a new FieldType is added without a corresponding case here. Adding
+// that explicit test is the missing piece; the silent-default fall-through is
+// preserved so a runtime call with an unknown FieldType still produces a
+// defensible KindInvalid instead of panicking, but a new FieldType constant
+// in pkg/plugin/manifest.go will be caught at test time rather than at runtime.
 func kindFromFieldType(ft rule.FieldType) rule.Kind {
 	switch ft {
 	case rule.TypeString:
@@ -1244,6 +1574,107 @@ func (c *Compiler) uniformArrayElementKind(arr *opLitArray) (rule.Kind, *Compile
 	return first, nil
 }
 
+// ========================== BitAnd op (D19) ==================================================
+
+// compileBitAnd type-checks both operands of `value & mask` as KindBytes and
+// rejects a literal-literal length mismatch at compile time. The runtime length
+// check (one side resolves to a field whose length is unknown at compile time)
+// is delegated to the evaluator, which surfaces the mismatch as a defensive
+// false (D19 — never panic).
+//
+// Three rejection paths:
+//
+//  1. left is not KindBytes → CodeTypeMismatch
+//  2. right is not KindBytes → CodeTypeMismatch
+//  3. both are literal bytes with different lengths → CodeTypeMismatch
+//     (detected by reading the stored Value's bytes; works for opLitBytes
+//     and any other op whose Kind is KindBytes)
+//
+// A field operand's Kind is statically determinable (opField carries a cached
+// FieldType; nodeKind returns its mapped Kind), so the per-operand Kind check
+// is purely compile-time. The per-byte AND test and the runtime length check
+// are the evaluator's concern.
+func (c *Compiler) compileBitAnd(nn *parser.BitAnd) (op, *CompileError) {
+	left, err := c.compileNode(nn.Left)
+	if err != nil {
+		return nil, err
+	}
+	right, err := c.compileNode(nn.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	leftKind := c.nodeKind(left)
+	rightKind := c.nodeKind(right)
+	if leftKind != rule.KindBytes {
+		ln, col := nn.Left.Pos()
+		return nil, &CompileError{
+			Line: ln, Col: col, Code: CodeTypeMismatch,
+			Message: fmt.Sprintf("&: left operand must be bytes, got %s", leftKind),
+		}
+	}
+	if rightKind != rule.KindBytes {
+		ln, col := nn.Right.Pos()
+		return nil, &CompileError{
+			Line: ln, Col: col, Code: CodeTypeMismatch,
+			Message: fmt.Sprintf("&: right operand must be bytes, got %s", rightKind),
+		}
+	}
+
+	// Literal-literal length mismatch — a pure compile-time check. We compare
+	// the stored byte lengths on the underlying Values; non-literal operands
+	// (field references, function-call results) reach the evaluator unchanged.
+	leftLen, leftLit := bytesLiteralLen(left)
+	rightLen, rightLit := bytesLiteralLen(right)
+	if leftLit && rightLit && leftLen != rightLen {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeTypeMismatch,
+			Message: fmt.Sprintf("&: literal byte lengths differ (%d vs %d)", leftLen, rightLen),
+		}
+	}
+
+	return &opBitAnd{pos: posOf(nn), left: left, right: right}, nil
+}
+
+// bytesLiteralLen returns the byte length of op when it is a literal KindBytes
+// expression, plus true. Non-literal ops return (0, false) and are NOT a compile-
+// error — the runtime length check (evalBitAnd) handles them. We inspect the
+// stored Value's bytes directly (no extra allocation); nil and empty slices
+// share the same zero length so the equality check is uniform.
+func bytesLiteralLen(o op) (int, bool) {
+	v, ok := literalValue(o)
+	if !ok || v.Kind() != rule.KindBytes {
+		return 0, false
+	}
+	b, _ := v.AsBytes()
+	return len(b), true
+}
+
+// literalValue returns the stored Value for an opLit* node, plus true. All other
+// ops return (Value{}, false). Used by bytesLiteralLen and isCIDRLit to keep the
+// per-kind literal-introspection logic in one place.
+func literalValue(o op) (rule.Value, bool) {
+	switch n := o.(type) {
+	case *opLitString:
+		return n.v, true
+	case *opLitInt:
+		return n.v, true
+	case *opLitFloat:
+		return n.v, true
+	case *opLitBool:
+		return n.v, true
+	case *opLitIP:
+		return n.v, true
+	case *opLitBytes:
+		return n.v, true
+	case *opLitDuration:
+		return n.v, true
+	case *opLitTimestamp:
+		return n.v, true
+	}
+	return rule.Value{}, false
+}
+
 // ========================== Strict op =======================================================
 
 // compileStrict compiles a parser.Strict node. The wrapper is a syntactic marker
@@ -1270,8 +1701,12 @@ func (c *Compiler) compileStrict(nn *parser.Strict) (op, *CompileError) {
 		return nil, err
 	}
 	switch inner.(type) {
-	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn:
-		// Strict directly wraps a binary op — no hoisting needed.
+	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn, *opBitAnd:
+		// Strict directly wraps a binary op — no hoisting needed. opBitAnd is
+		// included for completeness (D19 does not give `&` a coercion escape
+		// hatch, but a strict wrapper around it is still syntactically legal —
+		// the compiler flattens it transparently, mirroring the other binary
+		// operators).
 		return &opStrict{pos: posOf(nn), inner: inner}, nil
 	case *opLitString, *opLitInt, *opLitFloat, *opLitBool, *opLitIP, *opLitBytes, *opLitDuration, *opLitTimestamp:
 		// Strict wraps a literal — the parent binary op's compileX helper will

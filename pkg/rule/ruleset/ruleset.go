@@ -340,8 +340,13 @@ func (r *RuleSet) compileExpr(expression string) (*compiler.Plan, error) {
 // any observability hook. Callers that want upsert semantics should Remove first,
 // or use Replace for the existing-name path.
 //
-// Concurrency: holds the write lock for the full lex → parse → compile + append
-// cycle (DECISION D13). See the file header for the rationale on compile-under-lock.
+// Concurrency: compiles the expression WITHOUT holding the write lock, then
+// takes the write lock only for the duplicate-check and the append. This is the
+// "compile-outside-lock / publish-under-lock" design (DECISION D13): compile
+// is pure and read-only against the immutable Scheme, so it is safe to run
+// concurrently with other Adds or concurrent Matches. A bad expression returns
+// before the lock is taken, leaving r.rules untouched. See the file header for
+// the full concurrency rationale.
 func (r *RuleSet) Add(name, expression string) error {
 	if name == "" {
 		return errors.New("rule: Add requires a non-empty name")
@@ -438,8 +443,12 @@ func (r *RuleSet) Remove(name string) {
 // Replace returns ErrRuleNotFound when the named rule is absent. See ErrRuleNotFound's
 // doc comment for why we don't silently turn Replace into Add on a missing name.
 //
-// Concurrency: holds the write lock for the full lex → parse → compile + swap cycle
-// (D13). Same rationale as Add.
+// Concurrency: compiles the expression WITHOUT holding the write lock, then
+// takes the write lock only for the existing-name lookup and the in-place slot
+// swap. This is the "compile-outside-lock / publish-under-lock" design (DECISION
+// D13): same rationale as Add. A bad expression returns before the lock is
+// taken, leaving the existing rule in place (D13 atomicity: a bad expression
+// never disables a live rule). See the file header for the full rationale.
 func (r *RuleSet) Replace(name, expression string) error {
 	if name == "" {
 		return errors.New("rule: Replace requires a non-empty name")

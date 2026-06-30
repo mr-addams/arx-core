@@ -12,14 +12,14 @@ the payload.
 
 ## Status
 
-Phase 1 of Flow 001 is complete: Groups A–F (value system, FieldResolver
-boundary, lexer, parser, type-checker / compiler, evaluator, RuleSet, Builder)
-are merged into `main` and covered by a comprehensive test suite. Group G ships
-last, after the code is green; this README is part of Group G.
+Flow 001 (Groups A–F) is merged into `main`. Flow 002 (function layer
+restoration + engine hardening) is also merged: the v0.3.0 function
+table ships with 19 entries, the `&` bitmask operator on `KindBytes`
+completes the bytes operator table, the `itoaPrefix` IPv6 CIDR bug is
+fixed, and `pkg/rule` is ready to tag as v0.3.0.
 
-The `v0.2.0` tag is the planned Phase 1 release tag. It will be cut after
-Group G closes (this README plus `pkg/rule/REFERENCE.md` and the
-`cookbook/rule-engine/` entries).
+See [`REFERENCE.md`](./REFERENCE.md) for the v0.3.0 function reference
+table (19 functions) and the complete operator / type reference.
 
 ## Why pkg/rule exists
 
@@ -280,9 +280,25 @@ Programs are a constant token set plus a free-form identifier grammar
 |                  | at compile time.                                    |
 | `wildcard`       | Shell-glob-style match: `?` (any single char), `*`  |
 |                  | (any sequence). Pattern is a string literal.        |
+| `&`              | Bytes bitmask test: every bit set in the right     |
+|                  | operand is also set in the left. Both operands     |
+|                  | must be `KindBytes` (D20).                          |
 | `strict`         | Modifier keyword. v1 is strict-typed by default;    |
 |                  | the marker is preserved in the Plan for future      |
 |                  | semantics.                                          |
+
+**Functions (v0.3.0 — 19 entries).** In addition to operators, the engine
+ships a closed function table: `lower`, `upper`, `len`, `to_string`,
+`substring`, `concat`, `url_decode`, `url_encode`, `html_entity_decode`,
+`remove_bytes`, `regex_replace`, `lookup_json_string`, `ip_to_int`,
+`cidr_matches`, `now`, `unix_time`, `format_time`, `to_int`, `to_float`.
+Functions appear in expression position as `<name>(<arg>, <arg>, ...)` and
+are type-checked at compile time against the registered signature. A
+function call is a valid primary on either side of any operator that
+accepts the function's return Kind — e.g.
+`lower(http.host) starts_with "www"`, `to_int(http.size_str) gt 0`. The
+full per-function signature, alloc-free flag, and edge-case behaviour is
+in [`REFERENCE.md`](./REFERENCE.md) (DECISION D16).
 
 Booleans `true` and `false` are reserved as bare tokens (TBool, not
 TKeyword), so a name like `http.eq` is an identifier, not a comparison
@@ -302,10 +318,15 @@ ip"10.0.0.0/8"                   → KindIP (CIDR — evaluator does IP-in-CIDR 
 ```
 
 The list above is the v1 set. The full operator / function / type reference
-table — including type-rule edge cases (IP `eq` CIDR, `strict` placement,
-`in` over arrays of mixed Kinds) — lives in `pkg/rule/REFERENCE.md`. The
-runnable recipes (WAF-style rules, syslog anomaly rules, custom-plugin
-resolver wiring) live under `cookbook/rule-engine/`.
+table — including the v0.3.0 function table (19 entries: `lower`, `upper`,
+`len`, `to_string`, `substring`, `concat`, `url_decode`, `url_encode`,
+`html_entity_decode`, `remove_bytes`, `regex_replace`, `lookup_json_string`,
+`ip_to_int`, `cidr_matches`, `now`, `unix_time`, `format_time`, `to_int`,
+`to_float`), the `&` bitmask operator on `KindBytes`, and the type-rule
+edge cases (IP `eq` CIDR, `strict` placement, `in` over arrays of mixed
+Kinds) — lives in `pkg/rule/REFERENCE.md`. The runnable recipes
+(WAF-style rules, syslog anomaly rules, custom-plugin resolver wiring)
+live under `cookbook/rule-engine/`.
 
 Realistic rule examples:
 
@@ -504,11 +525,16 @@ architectural review, not a code change.
 ## References
 
 - [`pkg/rule/REFERENCE.md`](./REFERENCE.md) — full operator / function /
-  type reference table (Group G, Task G2).
+  type reference table, including the v0.3.0 function table (19 entries)
+  and the `&` bytes bitmask operator.
 - `cookbook/rule-engine/` — runnable cookbook recipes for WAF, syslog,
-  rate-profile, and a custom-plugin wiring example (Group G, Task G3).
+  rate-profile, and a custom-plugin wiring example.
 - [`.opencode/flows/001_2026-06-25_universal-rule-engine/DECISIONS.md`](../../.opencode/flows/001_2026-06-25_universal-rule-engine/DECISIONS.md) —
   the architectural decision records that govern the engine.
+- [`.opencode/flows/002_2026-06-29_function-layer-and-hardening/DECISIONS.md`](../../.opencode/flows/002_2026-06-29_function-layer-and-hardening/DECISIONS.md) —
+  Flow 002 decisions: D16 function registry, D17 compile-time `*net.IPNet`,
+  D18 `starts_with` / `ends_with` as operators, D19 `to_int` / `to_float`
+  coercion semantics, D20 `&` bitmask operator.
 - [`pkg/plugin/manifest.go`](../plugin/manifest.go) — `FieldDecl.Type`,
   the integration point between a plugin's Manifest and the rule engine.
 - [`pkg/plugin/event.go`](../plugin/event.go), [`pkg/plugin/envelope.go`](../plugin/envelope.go) —
@@ -518,8 +544,11 @@ architectural review, not a code change.
 
 | Version     | Status   | Notes                                                           |
 |-------------|----------|-----------------------------------------------------------------|
-| `v0.2.0`    | Planned  | Phase 1 complete: Groups A–F (value system, FieldResolver,      |
-|             |          | lexer, parser, compiler, evaluator, RuleSet, Builder) all       |
-|             |          | merged and tested. Group G (this README + REFERENCE.md +         |
-|             |          | cookbook) ship in the same release. First public release of     |
-|             |          | `pkg/rule`.                                                     |
+| `v0.3.0`    | Ready    | Flow 002 closed: 19-function table shipped (string, IP,         |
+|             |          | timestamp, coercion families), `&` bitmask operator on          |
+|             |          | `KindBytes`, `itoaPrefix` IPv6 CIDR bug fixed. `starts_with` /  |
+|             |          | `ends_with` confirmed as operators, not functions (D18).       |
+| `v0.2.0`    | Shipped  | Flow 001 complete: Groups A–F (value system, FieldResolver,     |
+|             |          | lexer, parser, compiler, evaluator, RuleSet, Builder) all      |
+|             |          | merged and tested. First public release of `pkg/rule`. Function |
+|             |          | table empty (D14). |

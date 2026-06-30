@@ -179,14 +179,14 @@ func TestEnvelopeResolver_Resolve_NonCoreNamespace(t *testing.T) {
 	resolver := EnvelopeResolver{}
 
 	cases := []string{
-		"http.method",        // arxsentinel-owned namespace (H2)
-		"http.status",        // arxsentinel-owned namespace (H2)
-		"syslog.facility",    // syslog source-owned namespace
-		"custom.field",       // arbitrary plugin-owned namespace
-		"core",               // namespace without trailing dot — malformed
-		"corex.timestamp",    // prefix collision — must NOT match core.*
-		".timestamp",         // leading dot — malformed
-		"",                   // empty string
+		"http.method",     // arxsentinel-owned namespace (H2)
+		"http.status",     // arxsentinel-owned namespace (H2)
+		"syslog.facility", // syslog source-owned namespace
+		"custom.field",    // arbitrary plugin-owned namespace
+		"core",            // namespace without trailing dot — malformed
+		"corex.timestamp", // prefix collision — must NOT match core.*
+		".timestamp",      // leading dot — malformed
+		"",                // empty string
 	}
 	for _, field := range cases {
 		t.Run(field, func(t *testing.T) {
@@ -220,10 +220,10 @@ func TestEnvelopeResolver_Resolve_UnknownCoreField(t *testing.T) {
 
 	cases := []string{
 		"core.unknown_field",
-		"core.method",     // looks plausible, not in Envelope
-		"core.ip",         // would belong to a plugin, not Envelope
-		"core.payload",    // explicitly out of scope (D3 payload opacity)
-		"core.size",       // looks like an envelope stat, not declared
+		"core.method",  // looks plausible, not in Envelope
+		"core.ip",      // would belong to a plugin, not Envelope
+		"core.payload", // explicitly out of scope (D3 payload opacity)
+		"core.size",    // looks like an envelope stat, not declared
 	}
 	for _, field := range cases {
 		t.Run(field, func(t *testing.T) {

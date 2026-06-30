@@ -95,11 +95,20 @@ func evalWafScheme(t *testing.T) *rule.Scheme {
 	mustEvalRegister(t, cat, "http", "method", rule.TypeString)
 	mustEvalRegister(t, cat, "http", "uri", rule.TypeString)
 	mustEvalRegister(t, cat, "http", "status", rule.TypeInt)
+	mustEvalRegister(t, cat, "http", "client_ip", rule.TypeIP)
 	mustEvalRegister(t, cat, "http", "ratio", rule.TypeFloat)
 	mustEvalRegister(t, cat, "http", "duration", rule.TypeDuration)
+	mustEvalRegister(t, cat, "http", "ts", rule.TypeTimestamp)
 	mustEvalRegister(t, cat, "http", "ua", rule.TypeString)
 	mustEvalRegister(t, cat, "http", "body", rule.TypeBytes)
 	mustEvalRegister(t, cat, "http", "headers", rule.TypeMap)
+	// http.pattern is a runtime-supplied regex pattern used by tests that
+	// exercise the non-literal-pattern path of regex_replace. The field is
+	// TypeString so the per-arg Kind check (KindString) succeeds and the
+	// evaluator compiles the pattern per call (DECISION D4 non-literal
+	// fallback). Production schemes do not need this field; it lives here
+	// for test surface coverage.
+	mustEvalRegister(t, cat, "http", "pattern", rule.TypeString)
 	mustEvalRegister(t, cat, "custom", "flag", rule.TypeBool)
 	return cat.Project("core", "http", "custom")
 }
@@ -249,6 +258,36 @@ func TestEval_TableDriven(t *testing.T) {
 		{"bytes_eq_nomatch", `http.body eq 0x"deadbeef"`,
 			map[string]rule.Value{"http.body": rule.NewBytes([]byte{0x01, 0x02})}, nil, ev, false},
 
+		// ── Bytes bitmask-test operator `&` (D19) ──────────────────────────────
+		// All mask bits set in value → true. Mask 0x0F selects the low nibble of
+		// each byte; value 0xFF has all bits set, so the AND result equals the
+		// mask at every position.
+		{"bitand_match", `http.body & 0x"0f0f"`,
+			map[string]rule.Value{"http.body": rule.NewBytes([]byte{0xff, 0xff})}, nil, ev, true},
+		// Same expression, value lacks one mask bit at byte 0 — 0xAA has only
+		// bits 1 and 3 set, so 0xAA & 0x0F == 0x0A != 0x0F → false.
+		{"bitand_one_bit_unset", `http.body & 0x"0f0f"`,
+			map[string]rule.Value{"http.body": rule.NewBytes([]byte{0xaa, 0xff})}, nil, ev, false},
+		// Empty mask is vacuously true (no bits required) when the value is
+		// also empty — same length, so the per-byte loop body never fires and
+		// the function returns true. Documented in D19.
+		{"bitand_empty_mask_true", `http.body & 0x""`,
+			map[string]rule.Value{"http.body": rule.NewBytes([]byte{})}, nil, ev, true},
+		// Runtime length mismatch (field on left, literal on right) → false, no
+		// panic. The literal-literal mismatch is rejected at compile time.
+		{"bitand_runtime_length_mismatch_false", `http.body & 0x"0000"`,
+			map[string]rule.Value{"http.body": rule.NewBytes([]byte{0x01, 0x02, 0x03})}, nil, ev, false},
+		// nil event — a literal-only expression does not depend on the event,
+		// so the verdict is the same as with a fixed event. We use 0x"ff" &
+		// 0x"ff" so the answer is unambiguously true (and the test confirms the
+		// operator is event-independent, the same property as TestEval_LiteralOnly).
+		// nil-event semantics for field-bearing plans live in TestEval_NilEvent.
+		{"bitand_literal_only_no_event_dependency", `0x"ff" & 0x"ff"`, nil, nil, nil, true},
+		// Unresolved field → false, no panic. The D3 contract surfaces "no
+		// value" as a defensive false at eval time.
+		{"bitand_unresolved_field_false", `http.body & 0x"ff"`,
+			map[string]rule.Value{}, nil, ev, false},
+
 		// ── Comparison: runtime type mismatch ────────────────────────────────
 		// Compiler accepts string eq string, but at runtime the resolver returns
 		// an Int for http.method. The evaluator surfaces a no-match without panic.
@@ -267,6 +306,26 @@ func TestEval_TableDriven(t *testing.T) {
 		{"ip_in_plain_match", `ip"10.1.2.3" in [ip"10.1.2.3", ip"10.1.2.4"]`, nil, nil, ev, true},
 		{"ip_in_plain_nomatch", `ip"8.8.8.8" in [ip"10.1.2.3", ip"10.1.2.4"]`, nil, nil, ev, false},
 		{"ip_in_mixed", `ip"10.1.2.3" in [ip"10.1.2.3", ip"192.168.0.0/16"]`, nil, nil, ev, true},
+
+		// ── IPv6 CIDR — Group G (D17). The itoaPrefix bug returned "128" for any
+		//    p ∈ [100, 128], corrupting every /100../127 IPv6 CIDR match. These
+		//    cases were silent on IPv4 (masks ≤ 32) and would have shipped as a
+		//    broken security-policy filter for IPv6 deployments. All cases
+		//    verified against net.ParseCIDR + net.IPNet.Contains.
+		{"ipv6_eq_cidr_slash64_match", `ip"2001:db8::1" eq ip"2001:db8::/64"`, nil, nil, ev, true},
+		{"ipv6_eq_cidr_slash64_nomatch", `ip"2001:db8:0:1::1" eq ip"2001:db8::/64"`, nil, nil, ev, false},
+		{"ipv6_eq_cidr_slash100_match", `ip"2001:db8::1" eq ip"2001:db8::/100"`, nil, nil, ev, true},
+		{"ipv6_eq_cidr_slash100_nomatch", `ip"2001:db8::ffff:ffff" eq ip"2001:db8::/100"`, nil, nil, ev, false},
+		{"ipv6_eq_cidr_slash127_match", `ip"2001:db8::1" eq ip"2001:db8::/127"`, nil, nil, ev, true},
+		{"ipv6_eq_cidr_slash127_nomatch", `ip"2001:db8::2" eq ip"2001:db8::/127"`, nil, nil, ev, false},
+		{"ipv6_eq_cidr_slash128_match", `ip"2001:db8::1" eq ip"2001:db8::1/128"`, nil, nil, ev, true},
+		{"ipv6_eq_cidr_slash128_nomatch", `ip"2001:db8::2" eq ip"2001:db8::1/128"`, nil, nil, ev, false},
+		{"ipv6_ne_cidr_slash100_match", `ip"2001:db8::ffff:ffff" ne ip"2001:db8::/100"`, nil, nil, ev, true},
+		{"ipv6_ne_cidr_slash100_nomatch", `ip"2001:db8::1" ne ip"2001:db8::/100"`, nil, nil, ev, false},
+		// Array form — IP `in` [CIDR...] where multiple elements may be CIDR.
+		{"ipv6_in_cidrs_match", `ip"2001:db8::1" in [ip"2001:db8::/64", ip"fe80::/10"]`, nil, nil, ev, true},
+		{"ipv6_in_cidrs_nomatch", `ip"::1" in [ip"2001:db8::/64", ip"fe80::/10"]`, nil, nil, ev, false},
+		{"ipv6_in_mixed_plain_and_cidr", `ip"2001:db8::1" in [ip"::1", ip"2001:db8::/64"]`, nil, nil, ev, true},
 
 		// ── String operators ──────────────────────────────────────────────────
 		{"contains_true", `http.uri contains "/api"`,
@@ -356,6 +415,39 @@ func TestEval_TableDriven(t *testing.T) {
 			map[string]rule.Value{"http.status": rule.NewInt(200)}, nil, ev, true},
 		{"strict_eq_false", `http.status eq strict 200`,
 			map[string]rule.Value{"http.status": rule.NewInt(404)}, nil, ev, false},
+
+		// ── Group H4 — Map cases (nil resolver entry, empty map) ─────────────
+		// Companion to the existing bracket_key_match / bracket_key_missing /
+		// bracket_field_not_map cases: those all assume the field is present in the
+		// resolver. The cases below pin (a) the resolver-omitted path (field not
+		// in resolver at all — equivalent to a nil Map surface), and (b) the
+		// explicit empty-map case. Both must surface as false with no panic.
+		{"bracket_unresolved_field_false", `http.headers["x-foo"] eq "bar"`,
+			map[string]rule.Value{}, nil, ev, false},
+		{"bracket_empty_map_missing_key_false", `http.headers["x-foo"] eq "bar"`,
+			nil,
+			map[string]rule.Value{"http.headers": rule.NewMap(map[string]rule.Value{})},
+			ev, false},
+
+		// ── Group H4 — Array `in` cases (single-element array hit/miss) ─────
+		// Companion to int_in_match/nomatch and string_in_match/nomatch: those
+		// exercise multi-element arrays. The single-element cases verify the
+		// boundary where the array length is 1, both hit and miss. (The empty
+		// array literal is rejected at compile time per the parser's
+		// "at least one element" rule — there is no runtime empty-array path to
+		// exercise, so the case is not added.)
+		{"int_in_single_element_match", `http.status in [200]`,
+			map[string]rule.Value{"http.status": rule.NewInt(200)}, nil, ev, true},
+		{"int_in_single_element_nomatch", `http.status in [404]`,
+			map[string]rule.Value{"http.status": rule.NewInt(200)}, nil, ev, false},
+
+		// ── Group H4 — Bytes `&` extra case (literal-literal partial-mask) ────
+		// Companion to the six bitand cases already in the table (which all use
+		// http.body from the resolver or an empty mask). This single case pins
+		// the literal-literal path where both operands are static and the
+		// equal-length invariant (D20 §3) holds — value has only the masked
+		// bits set so AND equals the mask, true.
+		{"bitand_literal_literal_partial_mask", `0x"ff" & 0x"0f"`, nil, nil, ev, true},
 	}
 
 	for _, c := range cases {
@@ -393,6 +485,10 @@ func TestEval_NilEvent(t *testing.T) {
 		`http.uri wildcard "/api/*"`,
 		`http.uri matches "^/api/.*$"`,
 		`http.status eq 200 and http.uri contains "/api"`,
+		// Group F1 — bytes bitmask-test operator. The resolver returns false for
+		// every field when the event is nil (D3), so the predicate surfaces as
+		// no-match without panicking.
+		`http.body & 0x"0f0f"`,
 	}
 	for _, src := range expressions {
 		t.Run(src, func(t *testing.T) {
@@ -614,16 +710,113 @@ func BenchmarkEval_ComplexPlan(b *testing.B) {
 	}
 }
 
+// BenchmarkEvalIPInCIDR measures the IP-in-CIDR eval path under DECISION D17.
+//
+// Before D17 this benchmark reported multiple allocs/op because the evaluator
+// called net.ParseCIDR on every Eval. Post-D17 the only remaining allocations
+// come from rule.Value.AsIP's documented defensive IP-slice copy — that copy
+// is a property of the pkg/rule Value API (types.go AsIP: "The copy is
+// intentional — callers may keep the slice without aliasing the engine's
+// storage") and is OUT OF SCOPE for D17.
+//
+// What D17 guarantees and this benchmark proves:
+//
+//   - the *net.IPNet is resolved ONCE at compile time (compileLitIP);
+//   - eval reads ipLit.ipnet.Contains(leftIP) directly;
+//   - no net.ParseCIDR appears on the eval hot path.
+//
+// The benchmark itself is the regression guard — if a future change re-introduces
+// ParseCIDR (or any other allocation specifically tied to IP-CIDR eval), the
+// alloc count here will rise above the baseline of 1 (AsIP copy) per Eval.
+//
+// Run with `go test -bench=BenchmarkEvalIPInCIDR -benchmem ./pkg/rule/compiler/`.
+func BenchmarkEvalIPInCIDR(b *testing.B) {
+	scheme := evalBenchScheme()
+	p := evalBenchCompile(b, `ip"10.1.2.3" eq ip"10.0.0.0/8"`, scheme)
+	r := &mapResolver{} // empty resolver — both sides are literals, no field lookup
+	ev := &plugin.Event{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.Eval(r, ev) {
+			b.Fatal("Eval returned false on positive case")
+		}
+	}
+}
+
+// BenchmarkEvalIPInCIDRArray exercises the `in` array form — per-element
+// ipnet.Contains against CIDR array members. Pre-D17 this path called
+// ipInCIDR per element (one ParseCIDR per CIDR member); post-D17 each CIDR
+// member's pre-resolved *net.IPNet is read directly. The alloc count on a
+// positive match is constant: 1 for elem.AsIP() on the resolver-supplied
+// element, and 0 for the matched array member because the evalIn IP
+// branch short-circuits on cidr first and never computes rightIP for CIDR
+// members. A no-match run burns len(array) AsIP copies (left + each
+// non-CIDR member; CIDR members still short-circuit past AsIP), but the
+// ParseCIDR-per-element cost is gone.
+func BenchmarkEvalIPInCIDRArray(b *testing.B) {
+	scheme := evalBenchScheme()
+	p := evalBenchCompile(b,
+		`ip"10.1.2.3" in [ip"10.0.0.0/8", ip"172.16.0.0/12", ip"192.168.0.0/16"]`,
+		scheme)
+	r := &mapResolver{}
+	ev := &plugin.Event{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.Eval(r, ev) {
+			b.Fatal("Eval returned false on positive case")
+		}
+	}
+}
+
+// BenchmarkEvalBitAnd exercises the bytes bitmask-test operator on a 32-byte
+// value + 32-byte mask. The hot path inside evalBitAnd is a single for-range
+// loop over the two slices with no allocations — escape analysis confirms
+// `[]byte{} does not escape` / `append does not escape` on the per-byte loop
+// body. The benchmark reports the per-eval cost INCLUSIVE of the resolver's
+// interface-dispatch overhead (the test resolver returns a KindBytes Value
+// through the FieldResolver interface, which causes the underlying []byte
+// backing array to escape to the heap — a property of Go's interface-value
+// passing, not of the operator). The benchmark pins the contract so a future
+// refactor that introduces a temporary slice or a bytes.Equal-style comparison
+// in evalBitAnd is caught immediately as a measurable allocation increase.
+func BenchmarkEvalBitAnd(b *testing.B) {
+	scheme := evalBenchScheme()
+	p := evalBenchCompile(b, `http.body & 0x"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"`, scheme)
+	value := make([]byte, 32)
+	for i := range value {
+		value[i] = 0xff
+	}
+	r := &mapResolver{
+		scalars: map[string]rule.Value{
+			"http.body": rule.NewBytes(value),
+		},
+	}
+	ev := &plugin.Event{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.Eval(r, ev) {
+			b.Fatal("Eval returned false on positive case")
+		}
+	}
+}
+
 // ========================== Benchmark helpers ===============================================
 
 // evalBenchScheme is the minimal Scheme for the benchmark surface (Int + String
-// + String fields). Smaller than evalWafScheme — bench setup is on the cold
+// + String + Bytes fields). Smaller than evalWafScheme — bench setup is on the cold
 // path and we keep it lean.
 func evalBenchScheme() *rule.Scheme {
 	cat := rule.NewCatalog()
 	mustBenchRegister(cat, "http", "status", rule.TypeInt)
 	mustBenchRegister(cat, "http", "method", rule.TypeString)
 	mustBenchRegister(cat, "http", "uri", rule.TypeString)
+	mustBenchRegister(cat, "http", "body", rule.TypeBytes)
 	return cat.Project("http")
 }
 

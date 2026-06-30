@@ -26,9 +26,9 @@ import "time"
 // []StreamSpec. Это параметры-примитивы для оркестрации runtime'а:
 //
 //   - BufferSize      — размер каналов между ступенями (если не переопределён
-//                       в StreamSpec.BufferSize, Engine берёт это значение).
+//     в StreamSpec.BufferSize, Engine берёт это значение).
 //   - ShutdownTimeout — максимум времени на graceful shutdown всех стримов;
-//                       при превышении Engine.Run возвращает context.DeadlineExceeded.
+//     при превышении Engine.Run возвращает context.DeadlineExceeded.
 //   - TrackerGroup    — имя tracker-pool'а (см. arx-core/pkg/dedup и Phase 2: scoring pool).
 //
 // Все поля обязательны: если Product не знает значение, он ставит 0 и
