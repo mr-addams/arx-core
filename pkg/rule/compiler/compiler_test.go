@@ -34,6 +34,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/mr-addams/arx-core/pkg/plugin"
 	"github.com/mr-addams/arx-core/pkg/rule"
 	"github.com/mr-addams/arx-core/pkg/rule/parser"
 )
@@ -857,5 +858,39 @@ func TestCompiler_BitAnd_StrictWrapsIt(t *testing.T) {
 	}
 	if _, ok := s.inner.(*opBitAnd); !ok {
 		t.Errorf("strict.inner = %T, want *opBitAnd", s.inner)
+	}
+}
+
+// ========================== H3 — kindFromFieldType closed-set guard ==========================
+
+// TestKindFromFieldType_CoversAllFieldTypes pins the contract that every
+// declared pkg/plugin.FieldType constant has a non-Invalid mapping in
+// kindFromFieldType (compiler.go ~line 1290). kindFromFieldType has no
+// `default` case that panics — an unmapped FieldType silently returns
+// KindInvalid, which is defensible at runtime but a silent capability gap
+// at design time. Iterating every plugin.FieldType constant here means a new
+// FieldType added to pkg/plugin/manifest.go without a corresponding case in
+// kindFromFieldType fails the build rather than the runtime contract.
+//
+// The list mirrors pkg/plugin/manifest.go's declared constants. If pkg/plugin
+// gains a new FieldType, this test must be updated in the same change.
+func TestKindFromFieldType_CoversAllFieldTypes(t *testing.T) {
+	all := []plugin.FieldType{
+		plugin.TypeString,
+		plugin.TypeInt,
+		plugin.TypeFloat,
+		plugin.TypeBool,
+		plugin.TypeIP,
+		plugin.TypeBytes,
+		plugin.TypeTimestamp,
+		plugin.TypeDuration,
+		plugin.TypeArray,
+		plugin.TypeMap,
+	}
+	for _, ft := range all {
+		got := kindFromFieldType(ft)
+		if got == rule.KindInvalid {
+			t.Errorf("kindFromFieldType(%q) = KindInvalid — every declared FieldType must have a non-Invalid mapping", ft)
+		}
 	}
 }

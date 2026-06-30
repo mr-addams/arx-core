@@ -415,6 +415,39 @@ func TestEval_TableDriven(t *testing.T) {
 			map[string]rule.Value{"http.status": rule.NewInt(200)}, nil, ev, true},
 		{"strict_eq_false", `http.status eq strict 200`,
 			map[string]rule.Value{"http.status": rule.NewInt(404)}, nil, ev, false},
+
+		// ── Group H4 — Map cases (nil resolver entry, empty map) ─────────────
+		// Companion to the existing bracket_key_match / bracket_key_missing /
+		// bracket_field_not_map cases: those all assume the field is present in the
+		// resolver. The cases below pin (a) the resolver-omitted path (field not
+		// in resolver at all — equivalent to a nil Map surface), and (b) the
+		// explicit empty-map case. Both must surface as false with no panic.
+		{"bracket_unresolved_field_false", `http.headers["x-foo"] eq "bar"`,
+			map[string]rule.Value{}, nil, ev, false},
+		{"bracket_empty_map_missing_key_false", `http.headers["x-foo"] eq "bar"`,
+			nil,
+			map[string]rule.Value{"http.headers": rule.NewMap(map[string]rule.Value{})},
+			ev, false},
+
+		// ── Group H4 — Array `in` cases (single-element array hit/miss) ─────
+		// Companion to int_in_match/nomatch and string_in_match/nomatch: those
+		// exercise multi-element arrays. The single-element cases verify the
+		// boundary where the array length is 1, both hit and miss. (The empty
+		// array literal is rejected at compile time per the parser's
+		// "at least one element" rule — there is no runtime empty-array path to
+		// exercise, so the case is not added.)
+		{"int_in_single_element_match", `http.status in [200]`,
+			map[string]rule.Value{"http.status": rule.NewInt(200)}, nil, ev, true},
+		{"int_in_single_element_nomatch", `http.status in [404]`,
+			map[string]rule.Value{"http.status": rule.NewInt(200)}, nil, ev, false},
+
+		// ── Group H4 — Bytes `&` extra case (literal-literal partial-mask) ────
+		// Companion to the six bitand cases already in the table (which all use
+		// http.body from the resolver or an empty mask). This single case pins
+		// the literal-literal path where both operands are static and the
+		// equal-length invariant (D20 §3) holds — value has only the masked
+		// bits set so AND equals the mask, true.
+		{"bitand_literal_literal_partial_mask", `0x"ff" & 0x"0f"`, nil, nil, ev, true},
 	}
 
 	for _, c := range cases {

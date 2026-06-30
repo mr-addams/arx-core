@@ -431,15 +431,14 @@ type opWildcard struct {
 	left    op
 	pattern string // pre-validated literal string
 
-	// Изменение (Задача C2, evaluator): ленивая компиляция wildcard-паттерна в
-	// *regexp.Regexp. Компилятор (C1) НЕ компилирует regexp на этом этапе —
-	// compileWildcard остаётся без изменений (pattern валидируется как строка,
-	// не как regex). Эвалюатор компилирует паттерн при первом Eval через
-	// compileOnce, чтобы не платить за regexp.Compile на каждом Eval-вызове и
-	// при этом не делать compile-time compile (что потребовало бы расширения
-	// contract-стабильного C1 — sync.Once здесь держит compiler.go неизменным
-	// по поведению). Два новых поля additive: opWildcard неэкспортирован,
-	// публичный API не затронут.
+	// Change (Task C2, evaluator): lazy compilation of the wildcard pattern into
+	// a *regexp.Regexp. The compiler (C1) does NOT compile the regexp here —
+	// compileWildcard is unchanged (the pattern is validated as a string, not as
+	// a regex). The evaluator compiles the pattern on the first Eval via
+	// compileOnce, so we do not pay regexp.Compile on every Eval, and we avoid a
+	// compile-time compilation step (which would require extending the
+	// contract-stable C1 — sync.Once keeps compiler.go's behaviour unchanged).
+	// Two new fields added; opWildcard is unexported, public API untouched.
 	regex       *regexp.Regexp
 	compileOnce sync.Once
 }
@@ -1285,6 +1284,15 @@ func (c *Compiler) nodeKind(o op) rule.Kind {
 
 // kindFromFieldType maps a Scheme FieldType to the runtime Kind it represents. The
 // mapping is the inverse of the FieldType constants in scheme.go.
+//
+// Intentional fall-through: an unmapped FieldType returns KindInvalid. The
+// TestKindFromFieldType_CoversAllFieldTypes test in compiler_test.go guards
+// completeness — it iterates every plugin.FieldType constant and fails the
+// build if a new FieldType is added without a corresponding case here. Adding
+// that explicit test is the missing piece; the silent-default fall-through is
+// preserved so a runtime call with an unknown FieldType still produces a
+// defensible KindInvalid instead of panicking, but a new FieldType constant
+// in pkg/plugin/manifest.go will be caught at test time rather than at runtime.
 func kindFromFieldType(ft rule.FieldType) rule.Kind {
 	switch ft {
 	case rule.TypeString:
