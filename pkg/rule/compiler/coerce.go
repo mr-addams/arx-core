@@ -54,7 +54,6 @@ package compiler
 import (
 	"math"
 	"strconv"
-	"time"
 
 	"github.com/mr-addams/arx-core/pkg/rule"
 )
@@ -197,13 +196,3 @@ func evalToFloat(args []rule.Value) rule.Value {
 		return rule.NewFloat(0)
 	}
 }
-
-// ========================== no-op import anchors ==============================================
-
-// time is used directly only in the to_int KindTimestamp branch (ts.Unix()). The no-op
-// anchor keeps the import honest; remove it if the reference becomes indirect.
-var _ = time.Now
-
-// math is referenced in the doc comment and in the int64(f) contract. The no-op
-// anchor keeps the import honest.
-var _ = math.MaxInt64

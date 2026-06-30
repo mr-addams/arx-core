@@ -38,6 +38,12 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # 32-bit build: catches int/int64 overflow (e.g. an untyped 64-bit constant
+      # assigned to an `int`, which is 32-bit on GOARCH=386). amd64 builds miss this
+      # because int is 64-bit there; downstream multi-arch container builds do not.
+      - name: go build (386 / 32-bit)
+        run: GOARCH=386 go build ./...
+
       - name: go vet
         run: go vet ./...
 
