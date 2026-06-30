@@ -40,9 +40,16 @@ import (
 
 // ========================== Helpers =========================================================
 
-// wafScheme returns a Scheme with the standard WAF profile field set: core.* (Envelope)
+// wafScheme returns a Scheme with the WAF profile field set: core.* (Envelope)
 // + http.* (typical WAF use cases). syslog.* fields are deliberately excluded to
 // exercise the D9 profile-gating error in test 1.
+//
+// Additional fields used by Group E function tests (client_ip / ratio) are
+// registered here as TEST FIXTURES only — a production WAF scheme does NOT
+// require them; they live in this helper so that the per-family E1/E2/E3
+// tests can reference a single shared Scheme. Future flows that change the
+// field set must keep the test fixtures stable unless they also update the
+// affected test files.
 func wafScheme(t *testing.T) *rule.Scheme {
 	t.Helper()
 	cat := rule.NewCatalog()
@@ -54,6 +61,8 @@ func wafScheme(t *testing.T) *rule.Scheme {
 	mustRegister(t, cat, "http", "method", rule.TypeString)
 	mustRegister(t, cat, "http", "uri", rule.TypeString)
 	mustRegister(t, cat, "http", "status", rule.TypeInt)
+	mustRegister(t, cat, "http", "client_ip", rule.TypeIP) // E1 test fixture
+	mustRegister(t, cat, "http", "ratio", rule.TypeFloat)  // E3 test fixture
 	mustRegister(t, cat, "http", "headers", rule.TypeMap)
 	mustRegister(t, cat, "http", "ua", rule.TypeString)
 	return cat.Project("core", "http")

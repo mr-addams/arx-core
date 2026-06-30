@@ -198,6 +198,10 @@ func eval(o op, resolver rule.FieldResolver, event *plugin.Event) bool {
 		// branch of compileRegexReplace populates this field. The non-literal
 		// branch leaves compiled nil and the evaluator compiles per call.
 		return evalRegexReplace(n, resolver, event)
+	case *opCIDRMatcher:
+		// The compile-time CIDR fast path (DECISION D17). If cidrNet is non-nil
+		// the evaluator calls Contains directly with zero per-eval ParseCIDR.
+		return evalCIDRMatcher(n, resolver, event)
 	}
 	// Unreachable for any Plan produced by the compiler (every concrete op type
 	// is handled above). Defensive false.
@@ -569,6 +573,22 @@ func evalRegexReplace(n *opRegexReplace, resolver rule.FieldResolver, event *plu
 	return b
 }
 
+// evalCIDRMatcher is the predicate-position dispatch for *opCIDRMatcher.
+// cidr_matches returns a bool, so predicate position is the natural use. The
+// value-returning counterpart below is what value-position call sites use
+// (e.g. `cidr_matches(ip, cidr) eq true`).
+func evalCIDRMatcher(n *opCIDRMatcher, resolver rule.FieldResolver, event *plugin.Event) bool {
+	v, ok := evalCIDRMatcherValue(n, resolver, event)
+	if !ok {
+		return false
+	}
+	b, ok := v.AsBool()
+	if !ok {
+		return false
+	}
+	return b
+}
+
 // evalRegexReplaceValue resolves subject, repl, and (when the pattern was not
 // precompiled) the pattern itself, then performs the replacement.
 //
@@ -608,6 +628,44 @@ func evalRegexReplaceValue(n *opRegexReplace, resolver rule.FieldResolver, event
 		return rule.NewString(subject), true
 	}
 	return rule.NewString(re.ReplaceAllString(subject, repl)), true
+}
+
+// evalCIDRMatcherValue resolves the IP argument and the CIDR argument (if a
+// non-literal was supplied), then answers whether the IP is contained by the
+// network. The compile-time fast path (n.cidrNet != nil) calls Contains
+// directly with zero per-eval parsing (DECISION D17). The non-literal fallback
+// parses the CIDR per call; a parse failure is surfaced as false, matching the
+// engine's no-panic defensive contract.
+//
+// All three call sites (registry-side evalCIDRMatches, compile-fast-path with
+// literal cidr, compile-fast-path with non-literal cidr) share the cidrContainsIP
+// helper in ip.go. Centralising the empty-IP guard and ParseCIDR error policy
+// keeps the contract identical across paths and prevents the documented "Both
+// functions are marked Allocating=false" equivalence from drifting.
+func evalCIDRMatcherValue(n *opCIDRMatcher, resolver rule.FieldResolver, event *plugin.Event) (rule.Value, bool) {
+	ipV, ok := evalValue(n.ipArg, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	ip, ok := ipV.AsIP()
+	if !ok {
+		return rule.Value{}, false
+	}
+
+	if n.cidrNet != nil {
+		// Literal fast path: network is pre-resolved at compile time. We pass
+		// an empty cidrText because cidrContainsIP only consults it when
+		// cidrNet is nil.
+		return rule.NewBool(cidrContainsIP(ip, "", n.cidrNet)), true
+	}
+
+	// Non-literal cidr: resolve the runtime string and parse per call.
+	cidrV, ok := evalValue(n.cidrArg, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	cidrText, _ := cidrV.AsString()
+	return rule.NewBool(cidrContainsIP(ip, cidrText, nil)), true
 }
 
 // evalValue walks an op and returns the Value it produces, plus an "ok" flag.
@@ -675,6 +733,12 @@ func evalValue(o op, resolver rule.FieldResolver, event *plugin.Event) (rule.Val
 		// (for non-literal patterns) lives in evalRegexReplace. We can reuse it
 		// here because its value-returning shape matches.
 		return evalRegexReplaceValue(n, resolver, event)
+
+	// ── cidr_matches — value-position (Group E1) ──────────────────────────────
+	case *opCIDRMatcher:
+		// Returns a bool. The eval-side path (with compile-time *net.IPNet fast
+		// path) lives in evalCIDRMatcherValue.
+		return evalCIDRMatcherValue(n, resolver, event)
 
 	// ── Defensive — predicate ops are not Values ───────────────────────────────
 	case *opLitArray, *opAnd, *opOr, *opNot, *opCmp,

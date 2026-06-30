@@ -331,6 +331,24 @@ type opRegexReplace struct {
 
 func (o *opRegexReplace) kind() opKind { return kFunc } // shares dispatch tag with opFunc
 
+// opCIDRMatcher is the compiled shape of `cidr_matches(ip, cidr)`. It is a
+// special case of opFunc: when the cidr argument is a literal string, the
+// *net.IPNet is parsed ONCE at compile time (DECISION D17) and stored on the
+// op. When the cidr argument is non-literal, the evaluator parses it per call.
+//
+// The struct keeps the generic kFunc dispatch tag so the evaluator can treat it
+// alongside opFunc; the difference is only the compile-time pre-processing of
+// the CIDR string into a reusable *net.IPNet.
+type opCIDRMatcher struct {
+	pos      pos
+	ipArg    op
+	cidrArg  op
+	cidrText string // set only when cidrNet != nil
+	cidrNet  *net.IPNet
+}
+
+func (o *opCIDRMatcher) kind() opKind { return kFunc } // shares dispatch tag with opFunc
+
 // ========================== Logic ops =======================================================
 
 type opAnd struct {
@@ -754,6 +772,15 @@ func (c *Compiler) compileFuncCall(nn *parser.FuncCall) (op, *CompileError) {
 	if nn.Name == "regex_replace" {
 		return c.compileRegexReplace(nn)
 	}
+	// cidr_matches has a special compile path mirroring regex_replace: when the
+	// cidr argument is a literal string, net.ParseCIDR runs once at compile time
+	// and the resulting *net.IPNet is stored on the op (DECISION D17). A non-
+	// literal cidr arg falls back to per-eval parsing. This special case is
+	// placed before the generic Lookup so the per-arg Kind checks and the literal
+	// fast path can share the same shape as compileRegexReplace.
+	if nn.Name == "cidr_matches" {
+		return c.compileCIDRMatcher(nn)
+	}
 	// Resolve the function name in the registry first — a bad name is the most
 	// common error and short-circuits arg compilation (no point validating args
 	// for a function that doesn't exist).
@@ -836,6 +863,70 @@ func (c *Compiler) compileFuncCall(nn *parser.FuncCall) (op, *CompileError) {
 	}
 
 	return &opFunc{pos: posOf(nn), name: nn.Name, args: args, spec: spec}, nil
+}
+
+// compileCIDRMatcher compiles `cidr_matches(ip, cidr)`. The first arg must be
+// KindIP and the second arg KindString. When the second arg is a literal
+// string, net.ParseCIDR is called once and the resulting *net.IPNet is stored
+// on the op. A non-literal cidr arg leaves cidrNet nil and the evaluator parses
+// per call.
+//
+// Errors:
+//   - CodeUnknownFunction: "cidr_matches" is not in the registry.
+//   - CodeBadFuncArity: arity != 2.
+//   - CodeBadFuncArgType: ip arg is not KindIP, or cidr arg is not KindString.
+//   - CodeInvalidLiteral: the literal cidr string is not a valid CIDR.
+func (c *Compiler) compileCIDRMatcher(nn *parser.FuncCall) (op, *CompileError) {
+	spec, ok := Lookup("cidr_matches")
+	if !ok {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeUnknownFunction,
+			Message: "function \"cidr_matches\" is not in the function table",
+		}
+	}
+	if len(nn.Args) != len(spec.ParamKinds) {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArity,
+			Message: fmt.Sprintf("function \"cidr_matches\" expects %d argument(s), got %d", len(spec.ParamKinds), len(nn.Args)),
+		}
+	}
+
+	// Compile args + per-arg Kind check.
+	ipOp, err := c.compileNode(nn.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(ipOp) != rule.KindIP {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"cidr_matches\" argument 1: expected ip, got %s", c.nodeKind(ipOp)),
+		}
+	}
+	cidrOp, err := c.compileNode(nn.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	if c.nodeKind(cidrOp) != rule.KindString {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeBadFuncArgType,
+			Message: fmt.Sprintf("function \"cidr_matches\" argument 2: expected string, got %s", c.nodeKind(cidrOp)),
+		}
+	}
+
+	out := &opCIDRMatcher{pos: posOf(nn), ipArg: ipOp, cidrArg: cidrOp}
+	if lit, ok := cidrOp.(*opLitString); ok {
+		cidrText, _ := lit.v.AsString()
+		_, ipnet, perr := net.ParseCIDR(cidrText)
+		if perr != nil {
+			return nil, &CompileError{
+				Line: nn.Line, Col: nn.Col, Code: CodeInvalidLiteral,
+				Message: fmt.Sprintf("invalid CIDR %q: %s", cidrText, perr.Error()),
+			}
+		}
+		out.cidrText = cidrText
+		out.cidrNet = ipnet
+	}
+	return out, nil
 }
 
 // ========================== Logic ops =======================================================
@@ -1158,6 +1249,13 @@ func (c *Compiler) nodeKind(o op) rule.Kind {
 		// regex_replace always returns a string. The op shares the kind tag
 		// with opFunc (kFunc) but does not carry a FuncSpec.
 		return rule.KindString
+	case *opCIDRMatcher:
+		// cidr_matches always returns a bool. The op shares the kind tag
+		// with opFunc (kFunc) but does not carry a FuncSpec; the explicit
+		// case here keeps the function's contract aligned with opFunc +
+		// opRegexReplace, so downstream operators type-check cidr_matches
+		// calls against KindBool (D16 §2).
+		return rule.KindBool
 	}
 	return rule.KindInvalid
 }
