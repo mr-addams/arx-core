@@ -1139,6 +1139,7 @@ func (t *Transport) buildTLSConfig(host string) *tls.Config {
 //     The Q4 hard-reject integration test injects a capture
 //     logger and asserts the formatted string contains BOTH the
 //     expected and the presented fingerprint.
+//
 // Behaviour (D24 three-case contract):
 //
 //   - rawCerts is empty OR the first cert is malformed OR the
@@ -1843,9 +1844,9 @@ func (t *Transport) Dial(ctx context.Context, peer PeerConfig) (*quic.Conn, erro
 		pinned, _ := t.known.lookupForVerify(peer.Host)
 		if pinned != "" && pinned != peer.Fingerprint {
 			closeWithChallengeErr(conn, errFingerprintCrossCheck{
-				host:       peer.Host,
-				expected:   peer.Fingerprint,
-				presented:  pinned,
+				host:      peer.Host,
+				expected:  peer.Fingerprint,
+				presented: pinned,
 			})
 			return nil, fmt.Errorf("transport: Dial: fingerprint cross-check for %q: %w",
 				peer.Host, errFingerprintCrossCheck{

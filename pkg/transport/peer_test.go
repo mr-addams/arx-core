@@ -51,7 +51,7 @@
 //     dropped, the handler is not called.
 //
 // All tests are hermetic: no real QUIC connections,
-//no t.TempDir() (no on-disk state), no goroutines that
+// no t.TempDir() (no on-disk state), no goroutines that
 // survive past t.Cleanup. The dispatch tests use
 // bytes.Buffer as the stream I/O surface, which is
 // the standard pattern for unit-testing a function
@@ -430,7 +430,7 @@ func (h *echoPongControlHandler) HandleControl(f *pb.Frame) (*pb.Frame, error) {
 	}
 	return &pb.Frame{
 		ProtocolVersion: CurrentProtocolVersion,
-		Body: &pb.Frame_Pong{Pong: &pb.Pong{Nonce: ping.GetNonce()}},
+		Body:            &pb.Frame_Pong{Pong: &pb.Pong{Nonce: ping.GetNonce()}},
 	}, nil
 }
 
@@ -509,7 +509,7 @@ func TestDispatchStreamTelemetryFrameReceived(t *testing.T) {
 		ProtocolVersion: CurrentProtocolVersion,
 		Body: &pb.Frame_Heartbeat{
 			Heartbeat: &pb.Heartbeat{
-				SenderNodeId:      "test-node",
+				SenderNodeId:     "test-node",
 				MonotonicClockMs: 42,
 			},
 		},
