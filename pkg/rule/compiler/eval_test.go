@@ -258,6 +258,36 @@ func TestEval_TableDriven(t *testing.T) {
 		{"bytes_eq_nomatch", `http.body eq 0x"deadbeef"`,
 			map[string]rule.Value{"http.body": rule.NewBytes([]byte{0x01, 0x02})}, nil, ev, false},
 
+		// ── Bytes bitmask-test operator `&` (D19) ──────────────────────────────
+		// All mask bits set in value → true. Mask 0x0F selects the low nibble of
+		// each byte; value 0xFF has all bits set, so the AND result equals the
+		// mask at every position.
+		{"bitand_match", `http.body & 0x"0f0f"`,
+			map[string]rule.Value{"http.body": rule.NewBytes([]byte{0xff, 0xff})}, nil, ev, true},
+		// Same expression, value lacks one mask bit at byte 0 — 0xAA has only
+		// bits 1 and 3 set, so 0xAA & 0x0F == 0x0A != 0x0F → false.
+		{"bitand_one_bit_unset", `http.body & 0x"0f0f"`,
+			map[string]rule.Value{"http.body": rule.NewBytes([]byte{0xaa, 0xff})}, nil, ev, false},
+		// Empty mask is vacuously true (no bits required) when the value is
+		// also empty — same length, so the per-byte loop body never fires and
+		// the function returns true. Documented in D19.
+		{"bitand_empty_mask_true", `http.body & 0x""`,
+			map[string]rule.Value{"http.body": rule.NewBytes([]byte{})}, nil, ev, true},
+		// Runtime length mismatch (field on left, literal on right) → false, no
+		// panic. The literal-literal mismatch is rejected at compile time.
+		{"bitand_runtime_length_mismatch_false", `http.body & 0x"0000"`,
+			map[string]rule.Value{"http.body": rule.NewBytes([]byte{0x01, 0x02, 0x03})}, nil, ev, false},
+		// nil event — a literal-only expression does not depend on the event,
+		// so the verdict is the same as with a fixed event. We use 0x"ff" &
+		// 0x"ff" so the answer is unambiguously true (and the test confirms the
+		// operator is event-independent, the same property as TestEval_LiteralOnly).
+		// nil-event semantics for field-bearing plans live in TestEval_NilEvent.
+		{"bitand_literal_only_no_event_dependency", `0x"ff" & 0x"ff"`, nil, nil, nil, true},
+		// Unresolved field → false, no panic. The D3 contract surfaces "no
+		// value" as a defensive false at eval time.
+		{"bitand_unresolved_field_false", `http.body & 0x"ff"`,
+			map[string]rule.Value{}, nil, ev, false},
+
 		// ── Comparison: runtime type mismatch ────────────────────────────────
 		// Compiler accepts string eq string, but at runtime the resolver returns
 		// an Int for http.method. The evaluator surfaces a no-match without panic.
@@ -422,6 +452,10 @@ func TestEval_NilEvent(t *testing.T) {
 		`http.uri wildcard "/api/*"`,
 		`http.uri matches "^/api/.*$"`,
 		`http.status eq 200 and http.uri contains "/api"`,
+		// Group F1 — bytes bitmask-test operator. The resolver returns false for
+		// every field when the event is nil (D3), so the predicate surfaces as
+		// no-match without panicking.
+		`http.body & 0x"0f0f"`,
 	}
 	for _, src := range expressions {
 		t.Run(src, func(t *testing.T) {
@@ -705,16 +739,51 @@ func BenchmarkEvalIPInCIDRArray(b *testing.B) {
 	}
 }
 
+// BenchmarkEvalBitAnd exercises the bytes bitmask-test operator on a 32-byte
+// value + 32-byte mask. The hot path inside evalBitAnd is a single for-range
+// loop over the two slices with no allocations — escape analysis confirms
+// `[]byte{} does not escape` / `append does not escape` on the per-byte loop
+// body. The benchmark reports the per-eval cost INCLUSIVE of the resolver's
+// interface-dispatch overhead (the test resolver returns a KindBytes Value
+// through the FieldResolver interface, which causes the underlying []byte
+// backing array to escape to the heap — a property of Go's interface-value
+// passing, not of the operator). The benchmark pins the contract so a future
+// refactor that introduces a temporary slice or a bytes.Equal-style comparison
+// in evalBitAnd is caught immediately as a measurable allocation increase.
+func BenchmarkEvalBitAnd(b *testing.B) {
+	scheme := evalBenchScheme()
+	p := evalBenchCompile(b, `http.body & 0x"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"`, scheme)
+	value := make([]byte, 32)
+	for i := range value {
+		value[i] = 0xff
+	}
+	r := &mapResolver{
+		scalars: map[string]rule.Value{
+			"http.body": rule.NewBytes(value),
+		},
+	}
+	ev := &plugin.Event{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !p.Eval(r, ev) {
+			b.Fatal("Eval returned false on positive case")
+		}
+	}
+}
+
 // ========================== Benchmark helpers ===============================================
 
 // evalBenchScheme is the minimal Scheme for the benchmark surface (Int + String
-// + String fields). Smaller than evalWafScheme — bench setup is on the cold
+// + String + Bytes fields). Smaller than evalWafScheme — bench setup is on the cold
 // path and we keep it lean.
 func evalBenchScheme() *rule.Scheme {
 	cat := rule.NewCatalog()
 	mustBenchRegister(cat, "http", "status", rule.TypeInt)
 	mustBenchRegister(cat, "http", "method", rule.TypeString)
 	mustBenchRegister(cat, "http", "uri", rule.TypeString)
+	mustBenchRegister(cat, "http", "body", rule.TypeBytes)
 	return cat.Project("http")
 }
 

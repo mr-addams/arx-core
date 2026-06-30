@@ -65,6 +65,7 @@ func wafScheme(t *testing.T) *rule.Scheme {
 	mustRegister(t, cat, "http", "ratio", rule.TypeFloat)  // E3 test fixture
 	mustRegister(t, cat, "http", "headers", rule.TypeMap)
 	mustRegister(t, cat, "http", "ua", rule.TypeString)
+	mustRegister(t, cat, "http", "body", rule.TypeBytes) // F1 bitmask-test fixture
 	return cat.Project("core", "http")
 }
 
@@ -610,7 +611,7 @@ func TestOpKind_TableEnumerated(t *testing.T) {
 		&opAnd{}, &opOr{}, &opNot{},
 		&opCmp{},
 		&opContains{}, &opStartsWith{}, &opEndsWith{}, &opMatches{}, &opWildcard{},
-		&opIn{}, &opStrict{},
+		&opIn{}, &opBitAnd{}, &opStrict{},
 	}
 	gotKinds := make([]opKind, 0, len(want))
 	for _, o := range want {
@@ -761,5 +762,100 @@ func TestCompiler_NotStringOp(t *testing.T) {
 	}
 	if _, ok := not.operand.(*opContains); !ok {
 		t.Errorf("operand = %T, want *opContains", not.operand)
+	}
+}
+
+// ========================== BitAnd operator tests (Group F1, D19) =============================
+//
+// The `&` bytes bitmask-test operator is end-to-end compiled and evaluated:
+// lexer (TAmpersand) → parser (BitAnd) → compiler (opBitAnd, CodeTypeMismatch
+// on operand-kind and literal-length mismatches) → evaluator (evalBitAnd,
+// alloc-free per-byte AND test).
+
+// TestCompiler_BitAnd_FieldAndLiteral verifies the happy path: both operands
+// are KindBytes, the literal length is fixed, and a field operand is allowed.
+// The Plan's root is *opBitAnd.
+func TestCompiler_BitAnd_FieldAndLiteral(t *testing.T) {
+	p := compileOK(t, `http.body & 0x"0f0f"`, wafScheme(t))
+	root := p.Root()
+	if _, ok := root.(*opBitAnd); !ok {
+		t.Fatalf("root = %T, want *opBitAnd", root)
+	}
+}
+
+// TestCompiler_BitAnd_LiteralAndLiteral is the all-literal happy path. The
+// runtime shape mirrors the field case — *opBitAnd with two opLitBytes children.
+func TestCompiler_BitAnd_LiteralAndLiteral(t *testing.T) {
+	p := compileOK(t, `0x"abcd" & 0x"0f0f"`, wafScheme(t))
+	root := p.Root()
+	if _, ok := root.(*opBitAnd); !ok {
+		t.Fatalf("root = %T, want *opBitAnd", root)
+	}
+}
+
+// TestCompiler_BitAnd_LiteralLengthMismatch verifies that two byte literals of
+// different lengths produce a compile error (DECISION D19 — length is statically
+// determinable when both operands are literals). The runtime mismatch case
+// (one side is a field) is covered by the eval-time defensive-false contract,
+// not by a compile error.
+func TestCompiler_BitAnd_LiteralLengthMismatch(t *testing.T) {
+	ce := compileErr(t, `0x"abcd" & 0x"ff"`, wafScheme(t))
+	if ce.Code != CodeTypeMismatch {
+		t.Errorf("literal length mismatch: got Code %q, want %q", ce.Code, CodeTypeMismatch)
+	}
+	if !strings.Contains(ce.Message, "length") {
+		t.Errorf("Message %q should mention the length mismatch", ce.Message)
+	}
+}
+
+// TestCompiler_BitAnd_LeftNotBytes verifies that a non-bytes left operand
+// (KindInt literal here) is rejected with CodeTypeMismatch. The error is
+// anchored at the left operand's source position.
+func TestCompiler_BitAnd_LeftNotBytes(t *testing.T) {
+	ce := compileErr(t, `42 & 0x"ff"`, wafScheme(t))
+	if ce.Code != CodeTypeMismatch {
+		t.Errorf("int & bytes: got Code %q, want %q", ce.Code, CodeTypeMismatch)
+	}
+	if !strings.Contains(ce.Message, "left operand must be bytes") {
+		t.Errorf("Message %q should identify the bad left operand", ce.Message)
+	}
+}
+
+// TestCompiler_BitAnd_RightNotBytes mirrors the left-not-bytes case for the
+// right operand. Same CodeTypeMismatch, but the error mentions the right
+// operand's kind.
+func TestCompiler_BitAnd_RightNotBytes(t *testing.T) {
+	ce := compileErr(t, `http.body & "mask"`, wafScheme(t))
+	if ce.Code != CodeTypeMismatch {
+		t.Errorf("bytes & string: got Code %q, want %q", ce.Code, CodeTypeMismatch)
+	}
+	if !strings.Contains(ce.Message, "right operand must be bytes") {
+		t.Errorf("Message %q should identify the bad right operand", ce.Message)
+	}
+}
+
+// TestCompiler_BitAnd_EmptyMaskIsLegal verifies that `value & 0x""` compiles
+// successfully. The empty mask is documented as a vacuously-true predicate
+// (D19); a runtime-only test in eval_test.go pins the verdict.
+func TestCompiler_BitAnd_EmptyMaskIsLegal(t *testing.T) {
+	p := compileOK(t, `http.body & 0x""`, wafScheme(t))
+	if _, ok := p.Root().(*opBitAnd); !ok {
+		t.Fatalf("root = %T, want *opBitAnd", p.Root())
+	}
+}
+
+// TestCompiler_BitAnd_StrictWrapsIt verifies that the `strict` modifier is
+// accepted around `&` — the compiler flattens it transparently (compileStrict
+// already lists *opBitAnd as a strict-eligible inner op). The root of the
+// Plan is *opStrict wrapping *opBitAnd.
+func TestCompiler_BitAnd_StrictWrapsIt(t *testing.T) {
+	p := compileOK(t, `strict (http.body & 0x"ff")`, wafScheme(t))
+	root := p.Root()
+	s, ok := root.(*opStrict)
+	if !ok {
+		t.Fatalf("root = %T, want *opStrict", root)
+	}
+	if _, ok := s.inner.(*opBitAnd); !ok {
+		t.Errorf("strict.inner = %T, want *opBitAnd", s.inner)
 	}
 }

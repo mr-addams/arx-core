@@ -183,6 +183,10 @@ func eval(o op, resolver rule.FieldResolver, event *plugin.Event) bool {
 	case *opIn:
 		return evalIn(n, resolver, event)
 
+	// ── BitAnd — bytes bitmask-test (DECISION D20) ───────────────────────────
+	case *opBitAnd:
+		return evalBitAnd(n, resolver, event)
+
 	// ── Strict — semantic no-op in v1, just unwrap the inner predicate ────────
 	case *opStrict:
 		// v1 strict is the default behavior (D14); the wrapper exists as a
@@ -512,6 +516,57 @@ func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 	}
 }
 
+// ========================== BitAnd eval (D19) ===============================================
+
+// evalBitAnd implements the bytes bitmask-test operator `value & mask`. The
+// operator returns true iff every bit set in mask is also set in value at the
+// same byte position, AND the two byte slices share the same length. The
+// per-byte test does not allocate (no temporary slice, no bytes.Equal call).
+//
+// Failure modes (all defensive — never panic, surface as false):
+//
+//   - Either operand fails to resolve (resolver returns no value).
+//   - Either operand's runtime Kind is not KindBytes (e.g. the field's
+//     runtime type drifted from the Scheme — the compiler's static check
+//     would have caught the static case).
+//   - Length mismatch — a runtime-only signal because one side is a field
+//     whose length is unknown at compile time. The literal-literal mismatch
+//     is rejected at compile time (CodeTypeMismatch, compileBitAnd).
+//   - Empty mask — vacuously true (no bits required). This matches the
+//     standard mathematical convention for an "all" quantifier over an
+//     empty set and is the contract documented in DECISION D19.
+//
+// The per-byte walk is a straight for-range loop with no helpers, no
+// allocations, and no branches beyond the loop body and the length guard.
+func evalBitAnd(n *opBitAnd, resolver rule.FieldResolver, event *plugin.Event) bool {
+	left, lok := evalValue(n.left, resolver, event)
+	right, rok := evalValue(n.right, resolver, event)
+	if !lok || !rok {
+		return false
+	}
+	if left.Kind() != rule.KindBytes || right.Kind() != rule.KindBytes {
+		return false
+	}
+	lv, _ := left.AsBytes()
+	rv, _ := right.AsBytes()
+	if len(lv) != len(rv) {
+		// Length mismatch is only reachable here when at least one operand
+		// was a non-literal (a field, a function call result). The literal-
+		// literal case is rejected at compile time.
+		return false
+	}
+	for i := range lv {
+		// All-bits-set test: every bit set in rv[i] must also be set in lv[i].
+		// This is equivalent to (lv[i] & rv[i]) == rv[i], written without the
+		// intermediate expression for clarity (and zero-cost — Go compiles both
+		// forms to the same instructions).
+		if lv[i]&rv[i] != rv[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // ========================== Function dispatch ===============================================
 
 // evalFuncCall is the eval-side dispatch for *opFunc in predicate position (the root
@@ -743,7 +798,7 @@ func evalValue(o op, resolver rule.FieldResolver, event *plugin.Event) (rule.Val
 	// ── Defensive — predicate ops are not Values ───────────────────────────────
 	case *opLitArray, *opAnd, *opOr, *opNot, *opCmp,
 		*opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard,
-		*opIn:
+		*opIn, *opBitAnd:
 		return rule.Value{}, false
 	}
 	return rule.Value{}, false

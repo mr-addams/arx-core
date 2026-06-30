@@ -110,6 +110,11 @@ const (
 	// TComma — "," separator.
 	TComma
 
+	// TAmpersand — "&". Single-char punct token used by the `&` bitmask-test
+	// operator on KindBytes (DECISION D19). No reserved-word handling — `&` is
+	// always punctuation, never part of an identifier.
+	TAmpersand
+
 	// TComment is intentionally absent from the public token set. Line comments
 	// ("# ...") are consumed silently by the lexer and NEVER appear in the token
 	// stream (D14).
@@ -155,6 +160,8 @@ func (k TokenKind) String() string {
 		return "rbrack"
 	case TComma:
 		return "comma"
+	case TAmpersand:
+		return "ampersand"
 	default:
 		return "unknown(" + strconv.FormatUint(uint64(k), 10) + ")"
 	}

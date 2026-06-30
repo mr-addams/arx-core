@@ -175,6 +175,7 @@ const (
 	kMatches
 	kWildcard
 	kIn
+	kBitAnd
 	kStrict
 )
 
@@ -462,6 +463,26 @@ type opStrict struct {
 
 func (o *opStrict) kind() opKind { return kStrict }
 
+// ========================== BitAnd op (D19) ==================================================
+
+// opBitAnd is the compiled shape of the bytes bitmask-test operator (`&`).
+// Both operands must be KindBytes (compile-time type-checked). The runtime
+// semantics — for every byte position i, (value[i] & mask[i]) == mask[i] —
+// are recorded in DECISION D19.
+//
+// The op itself is alloc-free at eval time (the evaluator walks the two
+// operand slices in place). The compiled shape does not pre-resolve anything
+// per-operand; length checks and the per-byte AND test are both cheap enough
+// to defer to the evaluator's hot path, and centralising them there keeps
+// the per-byte contract identical between literal-literal and field-literal
+// operands.
+type opBitAnd struct {
+	pos         pos
+	left, right op // both must be KindBytes after compile
+}
+
+func (o *opBitAnd) kind() opKind { return kBitAnd }
+
 // ========================== Compiler ========================================================
 
 // Compiler is the stateless, Scheme-bound type checker. Construct with NewCompiler;
@@ -585,6 +606,8 @@ func (c *Compiler) compileNode(n parser.Node) (op, *CompileError) {
 		return c.compileWildcard(nn)
 	case *parser.In:
 		return c.compileIn(nn)
+	case *parser.BitAnd:
+		return c.compileBitAnd(nn)
 	case *parser.Strict:
 		return c.compileStrict(nn)
 	default:
@@ -1238,7 +1261,7 @@ func (c *Compiler) nodeKind(o op) rule.Kind {
 		return rule.KindBool
 	case *opNot:
 		return rule.KindBool
-	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn, *opStrict:
+	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn, *opBitAnd, *opStrict:
 		return rule.KindBool
 	case *opFunc:
 		// Return the function's declared return Kind (D16 §2). The spec is
@@ -1543,6 +1566,107 @@ func (c *Compiler) uniformArrayElementKind(arr *opLitArray) (rule.Kind, *Compile
 	return first, nil
 }
 
+// ========================== BitAnd op (D19) ==================================================
+
+// compileBitAnd type-checks both operands of `value & mask` as KindBytes and
+// rejects a literal-literal length mismatch at compile time. The runtime length
+// check (one side resolves to a field whose length is unknown at compile time)
+// is delegated to the evaluator, which surfaces the mismatch as a defensive
+// false (D19 — never panic).
+//
+// Three rejection paths:
+//
+//  1. left is not KindBytes → CodeTypeMismatch
+//  2. right is not KindBytes → CodeTypeMismatch
+//  3. both are literal bytes with different lengths → CodeTypeMismatch
+//     (detected by reading the stored Value's bytes; works for opLitBytes
+//     and any other op whose Kind is KindBytes)
+//
+// A field operand's Kind is statically determinable (opField carries a cached
+// FieldType; nodeKind returns its mapped Kind), so the per-operand Kind check
+// is purely compile-time. The per-byte AND test and the runtime length check
+// are the evaluator's concern.
+func (c *Compiler) compileBitAnd(nn *parser.BitAnd) (op, *CompileError) {
+	left, err := c.compileNode(nn.Left)
+	if err != nil {
+		return nil, err
+	}
+	right, err := c.compileNode(nn.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	leftKind := c.nodeKind(left)
+	rightKind := c.nodeKind(right)
+	if leftKind != rule.KindBytes {
+		ln, col := nn.Left.Pos()
+		return nil, &CompileError{
+			Line: ln, Col: col, Code: CodeTypeMismatch,
+			Message: fmt.Sprintf("&: left operand must be bytes, got %s", leftKind),
+		}
+	}
+	if rightKind != rule.KindBytes {
+		ln, col := nn.Right.Pos()
+		return nil, &CompileError{
+			Line: ln, Col: col, Code: CodeTypeMismatch,
+			Message: fmt.Sprintf("&: right operand must be bytes, got %s", rightKind),
+		}
+	}
+
+	// Literal-literal length mismatch — a pure compile-time check. We compare
+	// the stored byte lengths on the underlying Values; non-literal operands
+	// (field references, function-call results) reach the evaluator unchanged.
+	leftLen, leftLit := bytesLiteralLen(left)
+	rightLen, rightLit := bytesLiteralLen(right)
+	if leftLit && rightLit && leftLen != rightLen {
+		return nil, &CompileError{
+			Line: nn.Line, Col: nn.Col, Code: CodeTypeMismatch,
+			Message: fmt.Sprintf("&: literal byte lengths differ (%d vs %d)", leftLen, rightLen),
+		}
+	}
+
+	return &opBitAnd{pos: posOf(nn), left: left, right: right}, nil
+}
+
+// bytesLiteralLen returns the byte length of op when it is a literal KindBytes
+// expression, plus true. Non-literal ops return (0, false) and are NOT a compile-
+// error — the runtime length check (evalBitAnd) handles them. We inspect the
+// stored Value's bytes directly (no extra allocation); nil and empty slices
+// share the same zero length so the equality check is uniform.
+func bytesLiteralLen(o op) (int, bool) {
+	v, ok := literalValue(o)
+	if !ok || v.Kind() != rule.KindBytes {
+		return 0, false
+	}
+	b, _ := v.AsBytes()
+	return len(b), true
+}
+
+// literalValue returns the stored Value for an opLit* node, plus true. All other
+// ops return (Value{}, false). Used by bytesLiteralLen and isCIDRLit to keep the
+// per-kind literal-introspection logic in one place.
+func literalValue(o op) (rule.Value, bool) {
+	switch n := o.(type) {
+	case *opLitString:
+		return n.v, true
+	case *opLitInt:
+		return n.v, true
+	case *opLitFloat:
+		return n.v, true
+	case *opLitBool:
+		return n.v, true
+	case *opLitIP:
+		return n.v, true
+	case *opLitBytes:
+		return n.v, true
+	case *opLitDuration:
+		return n.v, true
+	case *opLitTimestamp:
+		return n.v, true
+	}
+	return rule.Value{}, false
+}
+
 // ========================== Strict op =======================================================
 
 // compileStrict compiles a parser.Strict node. The wrapper is a syntactic marker
@@ -1569,8 +1693,12 @@ func (c *Compiler) compileStrict(nn *parser.Strict) (op, *CompileError) {
 		return nil, err
 	}
 	switch inner.(type) {
-	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn:
-		// Strict directly wraps a binary op — no hoisting needed.
+	case *opCmp, *opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard, *opIn, *opBitAnd:
+		// Strict directly wraps a binary op — no hoisting needed. opBitAnd is
+		// included for completeness (D19 does not give `&` a coercion escape
+		// hatch, but a strict wrapper around it is still syntactically legal —
+		// the compiler flattens it transparently, mirroring the other binary
+		// operators).
 		return &opStrict{pos: posOf(nn), inner: inner}, nil
 	case *opLitString, *opLitInt, *opLitFloat, *opLitBool, *opLitIP, *opLitBytes, *opLitDuration, *opLitTimestamp:
 		// Strict wraps a literal — the parent binary op's compileX helper will

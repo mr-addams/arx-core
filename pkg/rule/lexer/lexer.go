@@ -239,6 +239,13 @@ func (l *lexer) scanToken() Token {
 	case c == ',':
 		l.advance(1)
 		return Token{Kind: TComma, Line: line, Column: col}
+	case c == '&':
+		// Bitwise AND operator — tokenized as punctuation (no reserved-word
+		// handling). Bound to the `value & mask` all-bits-set bitmask test on
+		// KindBytes; see DECISION D19 and the BitAnd AST / opBitAnd plumbing
+		// in parser / compiler / evaluator.
+		l.advance(1)
+		return Token{Kind: TAmpersand, Line: line, Column: col}
 	default:
 		// Any other byte is unrecognized — emit TError and advance one byte. This
 		// keeps the lexer moving past unknown bytes so the parser can report a
