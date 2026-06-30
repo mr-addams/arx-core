@@ -25,10 +25,10 @@ import (
 // impls produce. Tests marshal to []byte before Push and unmarshal after
 // Pop to assert byte-preservation. Core does not import the product type.
 type jsonFields struct {
-	IP      string `json:"ip"`
-	Level   string `json:"level"`
-	Score   int    `json:"score"`
-	Reason  string `json:"reason"`
+	IP      string   `json:"ip"`
+	Level   string   `json:"level"`
+	Score   int      `json:"score"`
+	Reason  string   `json:"reason"`
 	Modules []string `json:"modules"`
 }
 

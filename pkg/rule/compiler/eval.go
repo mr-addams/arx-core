@@ -21,8 +21,11 @@
 //     - Compilation / type-checking — lives in compiler.go (Task C1).
 //     - Field resolvers — EnvelopeResolver lives in pkg/rule, plugin resolvers in
 //       their respective plugins (DECISION D3).
-//     - Function-table execution — v1 function table is closed and empty; the
-//       evaluator surfaces a defensive false for opFunc rather than panicking.
+//     - Function-table execution — the v0.3.0 function table (DECISION D16) is
+//       closed and populated. compileFuncCall rejects unknown names / wrong arity
+//       / per-argument Kind mismatches at compile time; the evaluator dispatches
+//       via the spec's Eval entry point and surfaces a defensive false if any
+//       argument fails to resolve.
 //
 //   DEPENDENCY RULE:
 //     stdlib only (D2): net, regexp, strings. Plus sibling pkg/rule
@@ -54,7 +57,6 @@
 package compiler
 
 import (
-	"net"
 	"regexp"
 	"strings"
 
@@ -181,19 +183,29 @@ func eval(o op, resolver rule.FieldResolver, event *plugin.Event) bool {
 	case *opIn:
 		return evalIn(n, resolver, event)
 
+	// ── BitAnd — bytes bitmask-test (DECISION D20) ───────────────────────────
+	case *opBitAnd:
+		return evalBitAnd(n, resolver, event)
+
 	// ── Strict — semantic no-op in v1, just unwrap the inner predicate ────────
 	case *opStrict:
 		// v1 strict is the default behavior (D14); the wrapper exists as a
 		// syntactic marker only. Just evaluate the inner op.
 		return eval(n.inner, resolver, event)
 
-	// ── Function call — unreachable in v1 (C1 rejects all FuncCalls) ──────────
+	// ── Function call — dispatch via the registry (DECISION D16) ──────────────
 	case *opFunc:
-		// Defensive: should never happen on a Plan produced by a successful
-		// Compile call (compileFuncCall rejects every FuncCall with
-		// CodeUnknownFunction). A manually-built Plan containing opFunc would
-		// reach here; surfacing false avoids a panic.
-		return false
+		return evalFuncCall(n, resolver, event)
+	case *opRegexReplace:
+		// The compile-time-precompiled regex path. If compiled is non-nil we
+		// honour DECISION D4 (no regexp.Compile per eval); the literal-pattern
+		// branch of compileRegexReplace populates this field. The non-literal
+		// branch leaves compiled nil and the evaluator compiles per call.
+		return evalRegexReplace(n, resolver, event)
+	case *opCIDRMatcher:
+		// The compile-time CIDR fast path (DECISION D17). If cidrNet is non-nil
+		// the evaluator calls Contains directly with zero per-eval ParseCIDR.
+		return evalCIDRMatcher(n, resolver, event)
 	}
 	// Unreachable for any Plan produced by the compiler (every concrete op type
 	// is handled above). Defensive false.
@@ -213,19 +225,20 @@ func evalCmp(n *opCmp, resolver rule.FieldResolver, event *plugin.Event) bool {
 
 	// Special case: IP `eq` / `ne` CIDR — if right is a CIDR literal, the
 	// comparison becomes IP-in-CIDR membership (left's IP against right's
-	// network). The compiler flags right opLitIP.cidr=true for this shape.
+	// network). The compiler pre-resolves the *net.IPNet at compile time
+	// (DECISION D17); eval just calls ipnet.Contains(left) — no ParseCIDR
+	// on the hot path.
 	if left.Kind() == rule.KindIP && right.Kind() == rule.KindIP {
 		if ipLit, ok := n.right.(*opLitIP); ok && ipLit.cidr {
 			leftIP, _ := left.AsIP()
-			ipNet := cidrNet(ipLit)
-			if ipNet == nil {
+			if ipLit.ipnet == nil {
 				return false
 			}
 			switch n.op {
 			case opCmpEq:
-				return ipNet.Contains(leftIP)
+				return ipLit.ipnet.Contains(leftIP)
 			case opCmpNe:
-				return !ipNet.Contains(leftIP)
+				return !ipLit.ipnet.Contains(leftIP)
 			default:
 				// Ordering comparisons against a CIDR are meaningless; the compiler
 				// only accepts eq / ne for IP-vs-CIDR, so reaching any other branch
@@ -256,24 +269,6 @@ func evalCmp(n *opCmp, resolver rule.FieldResolver, event *plugin.Event) bool {
 		return compareLess(right, left) || left.Equal(right)
 	}
 	return false
-}
-
-// cidrNet reconstructs the *net.IPNet for a CIDR-flavoured IP literal. The
-// literal stores the network address in .v and the prefix length in .mask.
-// Reconstructing the IPNet on every call is one ParseCIDR per call — small
-// enough for the IP-vs-CIDR eq/ne path, which is not the inner-loop hot path
-// (those plans are scalar, not IP-membership).
-func cidrNet(ipLit *opLitIP) *net.IPNet {
-	if ipLit == nil || !ipLit.cidr {
-		return nil
-	}
-	ipStr := ipLit.v.String()
-	cidrStr := ipStr + "/" + itoaPrefix(ipLit.mask)
-	_, ipnet, err := net.ParseCIDR(cidrStr)
-	if err != nil {
-		return nil
-	}
-	return ipnet
 }
 
 // compareLess reports whether left is strictly less than right under the natural
@@ -456,7 +451,9 @@ func compileWildcardPattern(pattern string) *regexp.Regexp {
 
 // evalIn implements `element in {set}`. The set must be a *opLitArray (the
 // compiler enforces this). For IP elements, set members that are CIDR literals
-// produce IP-in-CIDR membership rather than plain equality.
+// produce IP-in-CIDR membership rather than plain equality. The *net.IPNet for
+// each CIDR literal was pre-resolved at compile time (DECISION D17), so the
+// array branch uses ipnet.Contains directly with no runtime ParseCIDR.
 func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 	elem, eok := evalValue(n.element, resolver, event)
 	if !eok {
@@ -473,9 +470,10 @@ func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 		return false
 	}
 	// Iterate the set. For IP elements we dispatch per-member: plain IP uses
-	// Equal, CIDR uses membership. For non-IP elements every member must share
-	// the same Kind (the compiler enforces this); Kind-mismatch surfaces as
-	// "not this member", and if no member matches we return false.
+	// Equal, CIDR uses membership (via the pre-resolved *net.IPNet on the
+	// opLitIP). For non-IP elements every member must share the same Kind
+	// (the compiler enforces this); Kind-mismatch surfaces as "not this
+	// member", and if no member matches we return false.
 	switch elem.Kind() {
 	case rule.KindIP:
 		leftIP, _ := elem.AsIP()
@@ -484,18 +482,20 @@ func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 			if !ok {
 				continue
 			}
-			rightIP, _ := ipLit.v.AsIP()
+			// Branch on cidr first so we never call right.AsIP() on CIDR
+			// members — the CIDR branch uses ipnet.Contains(leftIP) and
+			// does not need the right-side IP at all. Hoisting the cidr
+			// check avoids one wasted defensive-copy per matched/missed
+			// CIDR member (the IP-vs-CIDR eval path is hot).
 			if ipLit.cidr {
-				// The literal's stored net.IP is the network address; we need
-				// the CIDR (network + mask) for Contains. The mask was captured
-				// at compile time; reconstruct the net.IPNet inline.
-				if ipInCIDR(leftIP, rightIP, ipLit.mask) {
+				if ipLit.ipnet != nil && ipLit.ipnet.Contains(leftIP) {
 					return true
 				}
-			} else {
-				if leftIP.Equal(rightIP) {
-					return true
-				}
+				continue
+			}
+			rightIP, _ := ipLit.v.AsIP()
+			if leftIP.Equal(rightIP) {
+				return true
 			}
 		}
 		return false
@@ -516,49 +516,224 @@ func evalIn(n *opIn, resolver rule.FieldResolver, event *plugin.Event) bool {
 	}
 }
 
-// ipInCIDR reports whether left (a plain IP) is contained in the CIDR network
-// described by (network, prefix). prefix is the number of leading bits that
-// must match between left and network.
+// ========================== BitAnd eval (D19) ===============================================
+
+// evalBitAnd implements the bytes bitmask-test operator `value & mask`. The
+// operator returns true iff every bit set in mask is also set in value at the
+// same byte position, AND the two byte slices share the same length. The
+// per-byte test does not allocate (no temporary slice, no bytes.Equal call).
 //
-// We construct a net.IPNet on each call. This is technically a small allocation;
-// the hot path for IP `in` [CIDR] is rare enough (security policy filtering)
-// that we accept the cost in exchange for not threading a *net.IPNet through
-// the opLitIP struct (which would be a more invasive C1 contract change).
-func ipInCIDR(left, network net.IP, prefix int) bool {
-	if left == nil || network == nil {
+// Failure modes (all defensive — never panic, surface as false):
+//
+//   - Either operand fails to resolve (resolver returns no value).
+//   - Either operand's runtime Kind is not KindBytes (e.g. the field's
+//     runtime type drifted from the Scheme — the compiler's static check
+//     would have caught the static case).
+//   - Length mismatch — a runtime-only signal because one side is a field
+//     whose length is unknown at compile time. The literal-literal mismatch
+//     is rejected at compile time (CodeTypeMismatch, compileBitAnd).
+//   - Empty mask — vacuously true (no bits required). This matches the
+//     standard mathematical convention for an "all" quantifier over an
+//     empty set and is the contract documented in DECISION D19.
+//
+// The per-byte walk is a straight for-range loop with no helpers, no
+// allocations, and no branches beyond the loop body and the length guard.
+func evalBitAnd(n *opBitAnd, resolver rule.FieldResolver, event *plugin.Event) bool {
+	left, lok := evalValue(n.left, resolver, event)
+	right, rok := evalValue(n.right, resolver, event)
+	if !lok || !rok {
 		return false
 	}
-	_, ipnet, err := net.ParseCIDR(network.String() + "/" + itoaPrefix(prefix))
-	if err != nil {
+	if left.Kind() != rule.KindBytes || right.Kind() != rule.KindBytes {
 		return false
 	}
-	return ipnet.Contains(left)
+	lv, _ := left.AsBytes()
+	rv, _ := right.AsBytes()
+	if len(lv) != len(rv) {
+		// Length mismatch is only reachable here when at least one operand
+		// was a non-literal (a field, a function call result). The literal-
+		// literal case is rejected at compile time.
+		return false
+	}
+	for i := range lv {
+		// All-bits-set test: every bit set in rv[i] must also be set in lv[i].
+		// This is equivalent to (lv[i] & rv[i]) == rv[i], written without the
+		// intermediate expression for clarity (and zero-cost — Go compiles both
+		// forms to the same instructions).
+		if lv[i]&rv[i] != rv[i] {
+			return false
+		}
+	}
+	return true
 }
 
-// itoaPrefix is a tiny strconv-free prefix-length formatter. The prefix is in
-// the range [0, 128], so the rendered string is at most 3 bytes.
-func itoaPrefix(p int) string {
-	if p < 0 || p > 128 {
-		return "0"
+// ========================== Function dispatch ===============================================
+
+// evalFuncCall is the eval-side dispatch for *opFunc in predicate position (the root
+// of a Plan). The compile-time signature check (compileFuncCall, DECISION D16 §2)
+// has already verified the function name, arity, and per-argument Kinds — at eval
+// time we resolve each argument to a Value via evalValue and invoke the spec's
+// Eval entry point.
+//
+// If any argument fails to resolve (e.g. a field reference whose resolver returned
+// no value), the call is surfaced as "no match" (false) rather than panicking —
+// the same defensive contract as every other op in the evaluator.
+//
+// A function that returns a non-Bool Kind is misused at the root of a Plan (the
+// language expects a predicate). Defensive false.
+func evalFuncCall(n *opFunc, resolver rule.FieldResolver, event *plugin.Event) bool {
+	v, ok := evalFuncCallValue(n, resolver, event)
+	if !ok {
+		return false
 	}
-	if p < 10 {
-		return string(rune('0' + p))
+	b, ok := v.AsBool()
+	if !ok {
+		return false
 	}
-	if p < 100 {
-		return string(rune('0'+p/10)) + string(rune('0'+p%10))
+	return b
+}
+
+// evalFuncCallValue is the value-returning counterpart of evalFuncCall. It is used
+// by evalValue when the function appears in value position (e.g. inside a Cmp
+// operand: `lower(field) eq "abc"`). Returns the function's result Value plus an
+// ok flag — false if any argument failed to resolve.
+func evalFuncCallValue(n *opFunc, resolver rule.FieldResolver, event *plugin.Event) (rule.Value, bool) {
+	args := make([]rule.Value, len(n.args))
+	for i, a := range n.args {
+		v, ok := evalValue(a, resolver, event)
+		if !ok {
+			return rule.Value{}, false
+		}
+		args[i] = v
 	}
-	return "128"
+	return n.spec.Eval(args), true
+}
+
+// evalRegexReplace is the predicate-position dispatch for *opRegexReplace. The
+// function returns a string, so a predicate-position call (the function at the
+// root of a Plan) is a misuse. The engine's defensive contract surfaces this
+// as "no match" — same as every other op with the wrong return kind at root.
+//
+// We keep the function for symmetry with evalFuncCall; the value-returning
+// counterpart below is what value-position call sites use.
+func evalRegexReplace(n *opRegexReplace, resolver rule.FieldResolver, event *plugin.Event) bool {
+	v, ok := evalRegexReplaceValue(n, resolver, event)
+	if !ok {
+		return false
+	}
+	b, ok := v.AsBool()
+	if !ok {
+		return false
+	}
+	return b
+}
+
+// evalCIDRMatcher is the predicate-position dispatch for *opCIDRMatcher.
+// cidr_matches returns a bool, so predicate position is the natural use. The
+// value-returning counterpart below is what value-position call sites use
+// (e.g. `cidr_matches(ip, cidr) eq true`).
+func evalCIDRMatcher(n *opCIDRMatcher, resolver rule.FieldResolver, event *plugin.Event) bool {
+	v, ok := evalCIDRMatcherValue(n, resolver, event)
+	if !ok {
+		return false
+	}
+	b, ok := v.AsBool()
+	if !ok {
+		return false
+	}
+	return b
+}
+
+// evalRegexReplaceValue resolves subject, repl, and (when the pattern was not
+// precompiled) the pattern itself, then performs the replacement.
+//
+// DECISION D4 fast path: when n.compiled is non-nil, the regex is reused across
+// every Eval call — no per-eval regexp.Compile. This is the case for literal
+// patterns and the dominant case for compiled Plans.
+//
+// Non-literal patterns compile per call (regexp.Compile on a runtime-
+// supplied string). The function Eval signature returns a Value, not an error,
+// so a malformed per-eval pattern surfaces as the subject unchanged — the same
+// defensive contract as the registry entry's evalRegexReplaceFallback.
+func evalRegexReplaceValue(n *opRegexReplace, resolver rule.FieldResolver, event *plugin.Event) (rule.Value, bool) {
+	subjectV, ok := evalValue(n.subject, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	subject, _ := subjectV.AsString()
+
+	replV, ok := evalValue(n.repl, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	repl, _ := replV.AsString()
+
+	if n.compiled != nil {
+		return rule.NewString(n.compiled.ReplaceAllString(subject, repl)), true
+	}
+
+	// Non-literal pattern: compile per call from the resolved pattern value.
+	patternV, ok := evalValue(n.patternOp, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	pattern, _ := patternV.AsString()
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return rule.NewString(subject), true
+	}
+	return rule.NewString(re.ReplaceAllString(subject, repl)), true
+}
+
+// evalCIDRMatcherValue resolves the IP argument and the CIDR argument (if a
+// non-literal was supplied), then answers whether the IP is contained by the
+// network. The compile-time fast path (n.cidrNet != nil) calls Contains
+// directly with zero per-eval parsing (DECISION D17). The non-literal fallback
+// parses the CIDR per call; a parse failure is surfaced as false, matching the
+// engine's no-panic defensive contract.
+//
+// All three call sites (registry-side evalCIDRMatches, compile-fast-path with
+// literal cidr, compile-fast-path with non-literal cidr) share the cidrContainsIP
+// helper in ip.go. Centralising the empty-IP guard and ParseCIDR error policy
+// keeps the contract identical across paths and prevents the documented "Both
+// functions are marked Allocating=false" equivalence from drifting.
+func evalCIDRMatcherValue(n *opCIDRMatcher, resolver rule.FieldResolver, event *plugin.Event) (rule.Value, bool) {
+	ipV, ok := evalValue(n.ipArg, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	ip, ok := ipV.AsIP()
+	if !ok {
+		return rule.Value{}, false
+	}
+
+	if n.cidrNet != nil {
+		// Literal fast path: network is pre-resolved at compile time. We pass
+		// an empty cidrText because cidrContainsIP only consults it when
+		// cidrNet is nil.
+		return rule.NewBool(cidrContainsIP(ip, "", n.cidrNet)), true
+	}
+
+	// Non-literal cidr: resolve the runtime string and parse per call.
+	cidrV, ok := evalValue(n.cidrArg, resolver, event)
+	if !ok {
+		return rule.Value{}, false
+	}
+	cidrText, _ := cidrV.AsString()
+	return rule.NewBool(cidrContainsIP(ip, cidrText, nil)), true
 }
 
 // evalValue walks an op and returns the Value it produces, plus an "ok" flag.
-// Used by the comparison / string / In ops to get the operand values.
+// Used by the comparison / string / In ops to get the operand values, and by
+// evalFuncCallValue to resolve function arguments.
 //
 // For literal ops the Value is stored directly and returned without any resolver
-// involvement. For field / bracket ops the resolver is consulted. For nested
-// composite ops (Cmp, Contains, In, ...) we surface a defensive failure: a
-// comparison / membership op expects scalar operands, never another predicate.
-// The compiler rejects this shape, so reaching here is unreachable on a
-// compiler-produced Plan; we keep the guard for hand-built plans.
+// involvement. For field / bracket ops the resolver is consulted. For function
+// calls the args are resolved and the spec's Eval entry point produces the result.
+// For nested composite ops (Cmp, Contains, In, ...) we surface a defensive
+// failure: a comparison / membership op expects scalar operands, never another
+// predicate. The compiler rejects this shape, so reaching here is unreachable
+// on a compiler-produced Plan; we keep the guard for hand-built plans.
 func evalValue(o op, resolver rule.FieldResolver, event *plugin.Event) (rule.Value, bool) {
 	switch n := o.(type) {
 	// ── Literals — return the stored Value directly (zero alloc) ─────────────
@@ -603,22 +778,31 @@ func evalValue(o op, resolver rule.FieldResolver, event *plugin.Event) (rule.Val
 	case *opStrict:
 		return evalValue(n.inner, resolver, event)
 
+	// ── Function call — resolve args and dispatch via the spec (D16) ───────────
+	case *opFunc:
+		return evalFuncCallValue(n, resolver, event)
+
+	// ── regex_replace — value-position (Group D3) ─────────────────────────────
+	case *opRegexReplace:
+		// Returns a string. The eval-side resolution of subject / repl / pattern
+		// (for non-literal patterns) lives in evalRegexReplace. We can reuse it
+		// here because its value-returning shape matches.
+		return evalRegexReplaceValue(n, resolver, event)
+
+	// ── cidr_matches — value-position (Group E1) ──────────────────────────────
+	case *opCIDRMatcher:
+		// Returns a bool. The eval-side path (with compile-time *net.IPNet fast
+		// path) lives in evalCIDRMatcherValue.
+		return evalCIDRMatcherValue(n, resolver, event)
+
 	// ── Defensive — predicate ops are not Values ───────────────────────────────
 	case *opLitArray, *opAnd, *opOr, *opNot, *opCmp,
 		*opContains, *opStartsWith, *opEndsWith, *opMatches, *opWildcard,
-		*opIn, *opFunc:
+		*opIn, *opBitAnd:
 		return rule.Value{}, false
 	}
 	return rule.Value{}, false
 }
-
-// =========================================================================================
-//   Helpers for opLitIP pattern reconstruction
-// =========================================================================================
-
-// (kept minimal: cidrNet is the single helper used by evalCmp; ipInCIDR below
-//  uses itoaPrefix to format the prefix length without a strconv dependency on
-//  the hot path.)
 
 // compile-time conformance: Plan.Eval signature must stay stable for downstream
 // callers (the embedding plugin). The assignment below is a no-op at runtime;

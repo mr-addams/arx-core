@@ -479,8 +479,8 @@ func TestValidateFields_ZeroAllocationHint_NilOnSuccess(t *testing.T) {
 	// and the errs slice is not grown unnecessarily. This is the
 	// no-allocation-on-success contract from the brief.
 	producer := plugin.Manifest{
-		PluginID:  "p",
-		Produces:  envelopeProduces(),
+		PluginID: "p",
+		Produces: envelopeProduces(),
 	}
 	consumer := plugin.Manifest{
 		PluginID: "c",

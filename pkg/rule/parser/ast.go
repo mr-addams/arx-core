@@ -410,6 +410,26 @@ func (n *Wildcard) String() string {
 	return "Wildcard(" + n.Left.String() + ", " + n.Right.String() + ")"
 }
 
+// BitAnd is the bytes bitmask-test operator (`&`, D19). It is an infix
+// binary operator on KindBytes that returns KindBool. Syntactically it lives
+// in the comparison tier (same precedence as eq / ne / lt / le / gt / ge /
+// contains / starts_with / ends_with / matches / wildcard / in); the parser
+// dispatches on the `&` punct token to attach a BitAnd node.
+//
+// Semantics (D19): for every byte position i, (value[i] & mask[i]) == mask[i].
+// The operator requires len(value) == len(mask) — a literal-literal mismatch
+// is a compile error (CodeTypeMismatch); a field-vs-mismatch is a runtime
+// false (defensive).
+type BitAnd struct {
+	Line, Col   int
+	Left, Right Node
+}
+
+func (n *BitAnd) Pos() (int, int) { return n.Line, n.Col }
+func (n *BitAnd) String() string {
+	return "BitAnd(" + n.Left.String() + ", " + n.Right.String() + ")"
+}
+
 // In is a set membership test (`in` keyword, D14). Element is the value being
 // tested; Set is typically a LitArray. The parser does NOT type-check Element /
 // Set compatibility — the compiler (C1) confirms it.
@@ -501,6 +521,7 @@ var (
 	_ Node = (*EndsWith)(nil)
 	_ Node = (*Matches)(nil)
 	_ Node = (*Wildcard)(nil)
+	_ Node = (*BitAnd)(nil)
 	_ Node = (*In)(nil)
 	_ Node = (*Strict)(nil)
 )

@@ -102,11 +102,11 @@ func (s *slowSource) Run(ctx context.Context, out chan<- *plugin.Event) error {
 // invariant), so Events() returns the raw *plugin.Event slice for
 // assertions.
 type mockSink struct {
-	name     string
-	mu       sync.Mutex
-	events   []*plugin.Event
-	reloaded atomic.Int32 // счётчик reload-вызовов
-	loadError error       // если задан — Reload() вернёт эту ошибку
+	name      string
+	mu        sync.Mutex
+	events    []*plugin.Event
+	reloaded  atomic.Int32 // счётчик reload-вызовов
+	loadError error        // если задан — Reload() вернёт эту ошибку
 }
 
 func (s *mockSink) Name() string              { return s.name }

@@ -285,7 +285,7 @@ func TestMultilineReading(t *testing.T) {
 	tmpDir := t.TempDir()
 	filePath := filepath.Join(tmpDir, "multiline.log")
 
-// Create file with multiple lines
+	// Create file with multiple lines
 	content := "line 1\nline 2\nline 3\n"
 	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to create test file: %v", err)

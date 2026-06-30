@@ -12,7 +12,7 @@
 //    10.  in with literal array.
 //    11.  Strict placement OK: http.status eq strict 200.
 //    12.  Strict placement error: strict (a or b).
-//    13.  FuncCall rejected: lower(http.method) → unknown_function.
+//    13.  FuncCall unknown name rejected (Flow 002 D16): no_such_function(...) → unknown_function.
 //    14.  BracketAccess OK on Map field.
 //    15.  BracketAccess error: object not Map-typed.
 //    16.  BracketAccess error: key not string literal.
@@ -34,15 +34,23 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/mr-addams/arx-core/pkg/plugin"
 	"github.com/mr-addams/arx-core/pkg/rule"
 	"github.com/mr-addams/arx-core/pkg/rule/parser"
 )
 
 // ========================== Helpers =========================================================
 
-// wafScheme returns a Scheme with the standard WAF profile field set: core.* (Envelope)
+// wafScheme returns a Scheme with the WAF profile field set: core.* (Envelope)
 // + http.* (typical WAF use cases). syslog.* fields are deliberately excluded to
 // exercise the D9 profile-gating error in test 1.
+//
+// Additional fields used by Group E function tests (client_ip / ratio) are
+// registered here as TEST FIXTURES only — a production WAF scheme does NOT
+// require them; they live in this helper so that the per-family E1/E2/E3
+// tests can reference a single shared Scheme. Future flows that change the
+// field set must keep the test fixtures stable unless they also update the
+// affected test files.
 func wafScheme(t *testing.T) *rule.Scheme {
 	t.Helper()
 	cat := rule.NewCatalog()
@@ -54,8 +62,11 @@ func wafScheme(t *testing.T) *rule.Scheme {
 	mustRegister(t, cat, "http", "method", rule.TypeString)
 	mustRegister(t, cat, "http", "uri", rule.TypeString)
 	mustRegister(t, cat, "http", "status", rule.TypeInt)
+	mustRegister(t, cat, "http", "client_ip", rule.TypeIP) // E1 test fixture
+	mustRegister(t, cat, "http", "ratio", rule.TypeFloat)  // E3 test fixture
 	mustRegister(t, cat, "http", "headers", rule.TypeMap)
 	mustRegister(t, cat, "http", "ua", rule.TypeString)
+	mustRegister(t, cat, "http", "body", rule.TypeBytes) // F1 bitmask-test fixture
 	return cat.Project("core", "http")
 }
 
@@ -344,16 +355,22 @@ func TestCompiler_StrictOnRightOfCmp(t *testing.T) {
 	}
 }
 
-// ========================== 13. FuncCall rejected ===========================================
+// ========================== 13. Function registry compile errors ===========================
 
-// TestCompiler_FuncCallRejected covers test 13: any FuncCall in v1 is rejected. The
-// function table is closed AND empty. The error code is CodeUnknownFunction.
-func TestCompiler_FuncCallRejected(t *testing.T) {
-	ce := compileErr(t, `lower(http.method)`, wafScheme(t))
+// TestCompiler_FuncCall_UnknownName covers test 13a: a function name that is not in
+// the registry is rejected with CodeUnknownFunction. The negative surface is split
+// from the original TestCompiler_FuncCallRejected because the registry now has real
+// entries; arity / arg-type negatives land below (TestCompiler_FuncCall_BadArity,
+// TestCompiler_FuncCall_BadArgType) and depend on a real registered function.
+//
+// This is the only D16 §2 negative that can run without depending on a specific
+// registered function — every other negative tests against a function that exists.
+func TestCompiler_FuncCall_UnknownName(t *testing.T) {
+	ce := compileErr(t, `no_such_function(http.method)`, wafScheme(t))
 	if ce.Code != CodeUnknownFunction {
 		t.Errorf("got Code %q, want %q", ce.Code, CodeUnknownFunction)
 	}
-	if !strings.Contains(ce.Message, "lower") {
+	if !strings.Contains(ce.Message, "no_such_function") {
 		t.Errorf("Message %q should mention the function name", ce.Message)
 	}
 }
@@ -572,6 +589,16 @@ func TestCompiler_Concurrent(t *testing.T) {
 // TestOpKind_TableEnumerated pins the closed set of opKind constants. Adding a new
 // opKind is a breaking change to the evaluator's dispatch table; this test forces the
 // review to happen by failing loudly on any drift.
+//
+// Note on intentional sharing: opRegexReplace shares kFunc with opFunc. The reason
+// is dispatch reuse — the evaluator's kFunc branch already handles the "function
+// call" path, and adding a new opKind would force a new branch in both the
+// evaluator and nodeKind. Instead, opRegexReplace is a special-case of opFunc
+// (same shape from the evaluator's perspective: a call that returns a value),
+// with the compile-time optimisation that the regex is precompiled when the
+// pattern is a literal. The "shared kind" assertion below is therefore
+// INTENTIONALLY RELAXED — it is the reviewer's job to keep this comment
+// honest as the op surface evolves.
 func TestOpKind_TableEnumerated(t *testing.T) {
 	// We don't enumerate the numeric values here (those are part of the wire
 	// contract between Compile and Eval — pinning them is a TestOpKind_Stable below).
@@ -581,26 +608,33 @@ func TestOpKind_TableEnumerated(t *testing.T) {
 	want := []op{
 		&opLitBool{}, &opLitInt{}, &opLitFloat{}, &opLitString{},
 		&opLitIP{}, &opLitBytes{}, &opLitDuration{}, &opLitTimestamp{}, &opLitArray{},
-		&opField{}, &opBracket{}, &opFunc{},
+		&opField{}, &opBracket{}, &opFunc{}, &opRegexReplace{},
 		&opAnd{}, &opOr{}, &opNot{},
 		&opCmp{},
 		&opContains{}, &opStartsWith{}, &opEndsWith{}, &opMatches{}, &opWildcard{},
-		&opIn{}, &opStrict{},
+		&opIn{}, &opBitAnd{}, &opStrict{},
 	}
 	gotKinds := make([]opKind, 0, len(want))
 	for _, o := range want {
 		gotKinds = append(gotKinds, o.kind())
 	}
-	// Each concrete op returns a distinct kind tag — no two op types share a kind.
+	// Distinct tag assertion, minus the intentional opRegexReplace↔opFunc
+	// sharing documented above. We expect len(seen) == len(want) - 1.
 	seen := make(map[opKind]string, len(gotKinds))
 	for i, k := range gotKinds {
 		if other, dup := seen[k]; dup {
-			t.Errorf("opKind %d is shared between op types (%s and the one at index %d)", k, other, i)
+			// opRegexReplace shares kFunc with opFunc — that is the ONE
+			// permitted duplication. Anything else is a regression.
+			if !(k == kFunc &&
+				(strings.Contains(reflect.TypeOf(want[i]).String(), "opRegexReplace") ||
+					strings.Contains(other, "opRegexReplace"))) {
+				t.Errorf("opKind %d is shared between op types (%s and the one at index %d)", k, other, i)
+			}
 		}
 		seen[k] = reflect.TypeOf(want[i]).String()
 	}
-	if len(seen) != len(want) {
-		t.Errorf("opKind tags: got %d distinct, want %d", len(seen), len(want))
+	if len(seen) != len(want)-1 {
+		t.Errorf("opKind tags: got %d distinct, want %d (opRegexReplace↔opFunc share kFunc)", len(seen), len(want)-1)
 	}
 }
 
@@ -729,5 +763,134 @@ func TestCompiler_NotStringOp(t *testing.T) {
 	}
 	if _, ok := not.operand.(*opContains); !ok {
 		t.Errorf("operand = %T, want *opContains", not.operand)
+	}
+}
+
+// ========================== BitAnd operator tests (Group F1, D19) =============================
+//
+// The `&` bytes bitmask-test operator is end-to-end compiled and evaluated:
+// lexer (TAmpersand) → parser (BitAnd) → compiler (opBitAnd, CodeTypeMismatch
+// on operand-kind and literal-length mismatches) → evaluator (evalBitAnd,
+// alloc-free per-byte AND test).
+
+// TestCompiler_BitAnd_FieldAndLiteral verifies the happy path: both operands
+// are KindBytes, the literal length is fixed, and a field operand is allowed.
+// The Plan's root is *opBitAnd.
+func TestCompiler_BitAnd_FieldAndLiteral(t *testing.T) {
+	p := compileOK(t, `http.body & 0x"0f0f"`, wafScheme(t))
+	root := p.Root()
+	if _, ok := root.(*opBitAnd); !ok {
+		t.Fatalf("root = %T, want *opBitAnd", root)
+	}
+}
+
+// TestCompiler_BitAnd_LiteralAndLiteral is the all-literal happy path. The
+// runtime shape mirrors the field case — *opBitAnd with two opLitBytes children.
+func TestCompiler_BitAnd_LiteralAndLiteral(t *testing.T) {
+	p := compileOK(t, `0x"abcd" & 0x"0f0f"`, wafScheme(t))
+	root := p.Root()
+	if _, ok := root.(*opBitAnd); !ok {
+		t.Fatalf("root = %T, want *opBitAnd", root)
+	}
+}
+
+// TestCompiler_BitAnd_LiteralLengthMismatch verifies that two byte literals of
+// different lengths produce a compile error (DECISION D19 — length is statically
+// determinable when both operands are literals). The runtime mismatch case
+// (one side is a field) is covered by the eval-time defensive-false contract,
+// not by a compile error.
+func TestCompiler_BitAnd_LiteralLengthMismatch(t *testing.T) {
+	ce := compileErr(t, `0x"abcd" & 0x"ff"`, wafScheme(t))
+	if ce.Code != CodeTypeMismatch {
+		t.Errorf("literal length mismatch: got Code %q, want %q", ce.Code, CodeTypeMismatch)
+	}
+	if !strings.Contains(ce.Message, "length") {
+		t.Errorf("Message %q should mention the length mismatch", ce.Message)
+	}
+}
+
+// TestCompiler_BitAnd_LeftNotBytes verifies that a non-bytes left operand
+// (KindInt literal here) is rejected with CodeTypeMismatch. The error is
+// anchored at the left operand's source position.
+func TestCompiler_BitAnd_LeftNotBytes(t *testing.T) {
+	ce := compileErr(t, `42 & 0x"ff"`, wafScheme(t))
+	if ce.Code != CodeTypeMismatch {
+		t.Errorf("int & bytes: got Code %q, want %q", ce.Code, CodeTypeMismatch)
+	}
+	if !strings.Contains(ce.Message, "left operand must be bytes") {
+		t.Errorf("Message %q should identify the bad left operand", ce.Message)
+	}
+}
+
+// TestCompiler_BitAnd_RightNotBytes mirrors the left-not-bytes case for the
+// right operand. Same CodeTypeMismatch, but the error mentions the right
+// operand's kind.
+func TestCompiler_BitAnd_RightNotBytes(t *testing.T) {
+	ce := compileErr(t, `http.body & "mask"`, wafScheme(t))
+	if ce.Code != CodeTypeMismatch {
+		t.Errorf("bytes & string: got Code %q, want %q", ce.Code, CodeTypeMismatch)
+	}
+	if !strings.Contains(ce.Message, "right operand must be bytes") {
+		t.Errorf("Message %q should identify the bad right operand", ce.Message)
+	}
+}
+
+// TestCompiler_BitAnd_EmptyMaskIsLegal verifies that `value & 0x""` compiles
+// successfully. The empty mask is documented as a vacuously-true predicate
+// (D19); a runtime-only test in eval_test.go pins the verdict.
+func TestCompiler_BitAnd_EmptyMaskIsLegal(t *testing.T) {
+	p := compileOK(t, `http.body & 0x""`, wafScheme(t))
+	if _, ok := p.Root().(*opBitAnd); !ok {
+		t.Fatalf("root = %T, want *opBitAnd", p.Root())
+	}
+}
+
+// TestCompiler_BitAnd_StrictWrapsIt verifies that the `strict` modifier is
+// accepted around `&` — the compiler flattens it transparently (compileStrict
+// already lists *opBitAnd as a strict-eligible inner op). The root of the
+// Plan is *opStrict wrapping *opBitAnd.
+func TestCompiler_BitAnd_StrictWrapsIt(t *testing.T) {
+	p := compileOK(t, `strict (http.body & 0x"ff")`, wafScheme(t))
+	root := p.Root()
+	s, ok := root.(*opStrict)
+	if !ok {
+		t.Fatalf("root = %T, want *opStrict", root)
+	}
+	if _, ok := s.inner.(*opBitAnd); !ok {
+		t.Errorf("strict.inner = %T, want *opBitAnd", s.inner)
+	}
+}
+
+// ========================== H3 — kindFromFieldType closed-set guard ==========================
+
+// TestKindFromFieldType_CoversAllFieldTypes pins the contract that every
+// declared pkg/plugin.FieldType constant has a non-Invalid mapping in
+// kindFromFieldType (compiler.go ~line 1290). kindFromFieldType has no
+// `default` case that panics — an unmapped FieldType silently returns
+// KindInvalid, which is defensible at runtime but a silent capability gap
+// at design time. Iterating every plugin.FieldType constant here means a new
+// FieldType added to pkg/plugin/manifest.go without a corresponding case in
+// kindFromFieldType fails the build rather than the runtime contract.
+//
+// The list mirrors pkg/plugin/manifest.go's declared constants. If pkg/plugin
+// gains a new FieldType, this test must be updated in the same change.
+func TestKindFromFieldType_CoversAllFieldTypes(t *testing.T) {
+	all := []plugin.FieldType{
+		plugin.TypeString,
+		plugin.TypeInt,
+		plugin.TypeFloat,
+		plugin.TypeBool,
+		plugin.TypeIP,
+		plugin.TypeBytes,
+		plugin.TypeTimestamp,
+		plugin.TypeDuration,
+		plugin.TypeArray,
+		plugin.TypeMap,
+	}
+	for _, ft := range all {
+		got := kindFromFieldType(ft)
+		if got == rule.KindInvalid {
+			t.Errorf("kindFromFieldType(%q) = KindInvalid — every declared FieldType must have a non-Invalid mapping", ft)
+		}
 	}
 }

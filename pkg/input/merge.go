@@ -34,7 +34,8 @@ type LogFn func(tag, msg, level string)
 // Runs each Source in its own goroutine, closes out when all done.
 // Non-blocking — drops newest entry if buffer is full.
 //
-//   Called from: arx-core/pkg/runtime (engine.go), cmd/arxsentinel/pipeline.go.
+//	Called from: arx-core/pkg/runtime (engine.go), cmd/arxsentinel/pipeline.go.
+//
 // Blocking: waits for all sources to finish before closing the channel.
 func Merge(ctx context.Context, sources []plugin.Source, bufSize int, logFn LogFn) <-chan *plugin.Event {
 	out := make(chan *plugin.Event, bufSize)

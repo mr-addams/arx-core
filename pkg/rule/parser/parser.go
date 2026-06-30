@@ -289,8 +289,16 @@ func (p *Parser) parseBinaryOp() (Node, error) {
 	}
 
 	tok := p.peek()
-	if tok.Kind != lexer.TKeyword {
+	if tok.Kind != lexer.TKeyword && tok.Kind != lexer.TAmpersand {
 		return left, nil
+	}
+
+	// `&` is the bytes bitmask-test operator (DECISION D19). It is bound to a
+	// distinct TAmpersand punct token — it does not share the TKeyword path
+	// because it is not a word. Both branches share the comparison-tier
+	// precedence: tighter than `not` / `and` / `or`, looser than primary.
+	if tok.Kind == lexer.TAmpersand {
+		return p.parseBitAndTail(left, tok)
 	}
 
 	switch tok.Value {
@@ -395,6 +403,20 @@ func (p *Parser) parseStringOpTail(left Node, opTok lexer.Token) (Node, error) {
 	}
 	// Unreachable: parseBinaryOp dispatches only on the cases above.
 	return nil, p.errorAt(opTok, "internal: unknown string-op keyword %q", opTok.Value)
+}
+
+// parseBitAndTail completes the bytes bitmask-test expression once the left
+// operand and the `&` punct token have been consumed. The right operand is
+// a primary (no `strict` placement; D19 does not give `&` a strict modifier).
+// Source position is anchored at the `&` so error messages point at the
+// operator (not at the operands).
+func (p *Parser) parseBitAndTail(left Node, opTok lexer.Token) (Node, error) {
+	p.consume() // consume the '&' punct
+	right, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	return &BitAnd{Line: opTok.Line, Col: opTok.Column, Left: left, Right: right}, nil
 }
 
 // parseArrayLiteral parses a `[ expression ("," expression)* ]` array literal. The
