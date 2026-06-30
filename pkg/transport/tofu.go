@@ -424,6 +424,37 @@ func (kn *KnownNodes) Pin(host, fingerprint string) error {
 	return nil
 }
 
+// lookupForVerify returns the currently-pinned fingerprint for
+// host, or an empty string if no pin is recorded.
+//
+// This is a thin accessor for the Q2 verifyPeerCertificateImpl
+// hard-reject error path: when a mismatch is detected the
+// caller wants the error message to include BOTH the pinned
+// (expected) and presented (actual) fingerprints (D24 §2).
+// Check signals mismatch but does not return the pinned value
+// (its return contract is "what to do, not the data"); rather
+// than broaden Check's signature for one caller, the verifier
+// does a second read here. The read is cheap (single map
+// lookup under RLock) and observable: a future store that
+// mutates the pinned value during a hard-reject window would
+// surface as a different "expected" in the alert.
+//
+// The method is unexported on purpose: callers outside the
+// verification path do not need it. Pin / Check remain the
+// only public write / read surface.
+//
+// Returns ("", false) when no pin exists. The Q2 caller only
+// invokes this AFTER Check returned mismatch=true, so the
+// false branch is unreachable in practice — but a defensive
+// empty string is returned in that case so the error message
+// does not panic on a missing key.
+func (kn *KnownNodes) lookupForVerify(host string) (string, bool) {
+	kn.mu.RLock()
+	defer kn.mu.RUnlock()
+	fp, ok := kn.entries[host]
+	return fp, ok
+}
+
 // saveLocked is the on-disk persistence primitive used by both Save and Pin.
 // It must be called with mu already held: by RLock from Save (read-locked
 // iterators are safe because nothing mutates the map during the call), and

@@ -214,34 +214,51 @@ func IsControlStream(id uint64) bool {
 // v0.1.0 surface, evolution is forward-only).
 const CurrentProtocolVersion uint32 = 1
 
-// Logger is the minimal logging surface the protocol layer needs to
-// surface a version-mismatch WARN. It is an interface (not *log.Logger or
-// *slog.Logger directly) for one reason: test injection. P3's tests verify
-// that a version-mismatched frame produces a WARN log entry with the
-// version mentioned in the message; stdlib loggers write to io.Writer and
-// have no inspection API. By declaring the surface this layer needs (one
-// method, one variadic-args format) we can pass in a capture-Logger in
-// tests and the real logger in production without coupling the protocol
-// layer to any specific logging library. The transport package's real
-// logger adapter (in Group Q) implements this same one-method interface
-// and is wired in by the caller — protocol.go stays logger-agnostic.
+// Logger is the minimal logging surface the transport package uses
+// to surface both protocol anomalies (version-mismatch WARN, P3) and
+// security-relevant events (TOFU hard-reject ERROR, signed-challenge
+// failure ERROR — Q4).
+//
+// It is an interface (not *log.Logger or *slog.Logger directly) for
+// one reason: test injection. P3's tests verify that a version-
+// mismatched frame produces a WARN log entry, and Q4's tests verify
+// that a TOFU mismatch / forged-key challenge failure produces an
+// ERROR log entry. Stdlib loggers write to io.Writer and have no
+// inspection API, so the test code substitutes its own capture-Logger.
+// Declaring the surface this layer needs (two methods, both
+// variadic-args format) lets the test code inject a capture logger in
+// production and the real logger in tests without coupling the
+// transport to any specific logging library.
+//
+// Method semantics:
+//
+//   - Warnf logs a non-fatal anomaly. Protocol code uses this for
+//     version-mismatch drops (D27 §3) — they are NOT errors and a
+//     library must not pretend otherwise by using Errorf.
+//   - Errorf logs a security-relevant event that the operator MUST
+//     see: TOFU fingerprint mismatch (D24 §2 hard-reject), signed-
+//     challenge verification failure (D23 §4). Production code wires
+//     this to a real logger; the test layer's capture-Logger records
+//     the formatted string for assertion.
+//
+// Both methods follow the conventions of package log / slog:
+// %-verbs interpolate args, the trailing newline is appended by the
+// implementation.
 type Logger interface {
-	// Warnf logs a non-fatal anomaly. The format string follows the
-	// conventions of package log / slog: %-verbs interpolate args, the
-	// trailing newline is appended by the implementation. Protocol
-	// code never logs an Error or Fatal through this surface — version
-	// mismatches are NOT errors (D27 §3) and a library must not pretend
-	// otherwise.
+	// Warnf logs a non-fatal anomaly. See the type comment.
 	Warnf(format string, args ...any)
+	// Errorf logs a security-relevant event. See the type comment.
+	Errorf(format string, args ...any)
 }
 
 // nopLogger is the zero-value Logger for callers that genuinely have no
-// logger to inject. It silently discards every Warnf call. Exposed via
-// DiscardLogger() so callers in Group Q / R can opt into "no logging"
-// without writing their own no-op implementation.
+// logger to inject. It silently discards every Warnf / Errorf call.
+// Exposed via DiscardLogger() so callers in Group Q / R can opt into
+// "no logging" without writing their own no-op implementation.
 type nopLogger struct{}
 
-func (nopLogger) Warnf(string, ...any) {}
+func (nopLogger) Warnf(string, ...any)  {}
+func (nopLogger) Errorf(string, ...any) {}
 
 // DiscardLogger returns a Logger that drops every Warnf call. Useful for
 // tests that exercise paths OTHER than the version-mismatch branch and

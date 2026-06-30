@@ -293,6 +293,13 @@ func TestDecodeFrameTooLarge(t *testing.T) {
 // goroutines, which the helper does not do).
 type captureLogger struct {
 	warnings []string
+	// errors records every Errorf invocation. Added in Q4 when
+	// the Logger interface was extended to surface security-
+	// relevant events (TOFU mismatch, signed-challenge failure).
+	// The two slices are separate so the version-mismatch tests
+	// (P3) can keep asserting on warnings only and the Q4 tests
+	// can assert on errors only.
+	errors []string
 }
 
 // Warnf appends the formatted message (no trailing newline, matching the
@@ -301,6 +308,13 @@ type captureLogger struct {
 // rendered text, not the raw verb list.
 func (c *captureLogger) Warnf(format string, args ...any) {
 	c.warnings = append(c.warnings, fmt.Sprintf(format, args...))
+}
+
+// Errorf appends the formatted message to the captured errors slice.
+// Mirrors Warnf so the Q4 tests can assert on security-event log
+// records through the same capture logger type.
+func (c *captureLogger) Errorf(format string, args ...any) {
+	c.errors = append(c.errors, fmt.Sprintf(format, args...))
 }
 
 // atLeastOneVersionHint is a small helper: assert that at least one
