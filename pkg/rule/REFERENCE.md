@@ -400,6 +400,54 @@ ip.src in [ip"10.0.0.0/8", ip"172.16.0.0/12", ip"192.168.0.0/16"]
 syslog.facility in [0, 3, 16]
 ```
 
+### Bytes family
+
+| Operator | Arity | Left operand | Right operand | Result | Semantics                                                            |
+|----------|-------|--------------|---------------|--------|----------------------------------------------------------------------|
+| `&`      | 2     | `KindBytes`  | `KindBytes`   | `Bool` | Bitmask test: every bit set in `mask` is also set in `value`.         |
+
+The `&` operator (DECISION D20) answers "are all the bits in `mask`
+present in `value`?". Formally, the result is true iff for every byte
+position `i`, `(value[i] & mask[i]) == mask[i]`. This is the conventional
+"all-bits-set" test used to match a bit pattern within a byte payload
+(e.g. matching TCP flag combinations in a captured header, matching a
+protocol signature in raw bytes).
+
+**Operand rules.** Both operands must be `KindBytes`. A `KindString` is
+NOT acceptable — the bytes and string operator families share no path
+(the lex form `0x"..."` is hex-decoded into bytes; the lex form `"..."`
+is a Go string). A non-bytes operand is a `type_mismatch` compile error.
+
+**Length rules.** The two operands need not be the same length: the
+result is true iff, within the SHORTER length, every bit set in `mask`
+is also set in `value`. The remainder of the longer operand is
+implicitly required to be zero in `value` (a non-zero byte at any
+position outside the shorter mask's reach fails the test, because
+`mask[i] == 0` for the implicit "no mask" region, so the test at those
+positions is `(value[i] & 0) == 0`, which is true only when
+`value[i] == 0`).
+
+**Empty mask.** The right-hand side may be `0x""` (an empty bytes
+literal). The empty mask has no bits to test — the result is true iff
+the value is also empty (the "implicit zero" region covers the entire
+value). This is the natural identity element of the bitmask test.
+
+```text
+# A captured TCP header where the SYN+ACK flags are set, and no others.
+payload[0:1] & 0x"12" eq 0x"12"
+
+# Any byte with the high bit set in the first byte of the signature.
+payload.signature & 0x"80" eq 0x"80"
+
+# Empty mask matches an empty value only.
+raw_payload & 0x"" eq 0x""   # true iff raw_payload is empty
+```
+
+The `&` operator completes the v0.3.0 bytes operator table from Flow 001
+(D5). It is documented as an operator — not a function — because it is
+an infix keyword in the lexer (D14) and shares the comparison-tier
+precedence level (see [Precedence and associativity](#precedence-and-associativity)).
+
 ### `strict` modifier
 
 `strict` is a syntactic marker (DECISION D14) that wraps an operand of a
@@ -423,32 +471,83 @@ Rejected: `strict (a or b)` (no binary-op parent to attach to), bare
 
 ## Functions
 
-The v1 function table is **empty and closed**. Every `FuncCall` is rejected
-at compile time with `code_unknown_function` ("function %q is not in the v1
-function table"). A FuncCall node exists in the AST so the grammar has a
-forward-compatible extension point — adding a function in a future flow is a
-new case in `compileFuncCall`, not a parser-grammar change.
-
-Formally:
+v0.3.0 ships a closed function table of 19 entries (DECISION D16). The
+table is built at package init and never mutated afterwards. A function
+name lexes as `TIdent` (not `TKeyword`) because the closed reserved
+keyword set does not include function names — this is how the parser
+disambiguates `lower(http.host) starts_with "www"` (a function call
+followed by the `starts_with` operator) from a hypothetical keyword
+collision.
 
 ```text
 <func_name>(<arg>, <arg>, ...)
   ^^^^^^^^^
-  TIdent — the function name. Lexed as TIdent (NOT TKeyword) because the
-  reserved-keyword set does not include function names. Naming convention:
-  snake_case, lowercase, dot-d NOT allowed in a single func name (use
-  underscore). Future functions will be defined here with: signature
-  (ordered arg types), return Kind, semantic description.
+  TIdent — the function name. snake_case, lowercase; no dots in a single
+  func name (use underscore). Every name below is a literal in the table.
   ^^^^^^^^^^^
   Arguments are positional. Type-checking happens at compile time against
   the registered function signature. Wrong arity → code_bad_func_arity;
-  wrong arg Kind → code_bad_func_arg_type.
+  wrong arg Kind → code_bad_func_arg_type. ParamKinds declares
+  KindInvalid for "any Kind" parameters (used by the coercion functions
+  and by to_string).
 ```
 
-Reserved hooks (placeholder for future functions): `lower`, `upper`,
-`ip_to_int`, `len`, `substr`, etc. — none are registered in v1. A rule
-author who writes `lower(http.uri.path) eq "/admin"` gets a
-`code_unknown_function` error at compile time.
+### Function reference table (v0.3.0 — 19 entries)
+
+One row per registered function. Signature is "paramKinds → returnKind"
+where `...` marks a variadic last argument. The "Alloc" column mirrors
+`FuncSpec.Allocating` (`alloc-free` = no engine-side allocation beyond
+what the operation inherently needs; `allocating` = produces a new
+string/slice/builder per call).
+
+| Name                  | Signature                                                  | Returns       | Alloc        | Description / edge-case behaviour |
+|-----------------------|------------------------------------------------------------|---------------|--------------|-----------------------------------|
+| `lower`               | `(string) → string`                                        | `KindString`  | alloc-free   | `strings.ToLower`; stdlib may copy on mixed-case input. |
+| `upper`               | `(string) → string`                                        | `KindString`  | alloc-free   | `strings.ToUpper`; stdlib may copy on mixed-case input. |
+| `len`                 | `(string) → int`                                           | `KindInt`     | alloc-free   | Byte length of the input. |
+| `to_string`           | `(any) → string`                                           | `KindString`  | alloc-free   | `Value.String()` over the union; `KindInvalid` renders as `"<invalid>"`. |
+| `substring`           | `(string, int, int) → string`                              | `KindString`  | allocating   | Bounds-clamped. `start<0`→0; `end>len(s)`→`len(s)`; `start≥end`→`""`. Never panics. |
+| `concat`              | `(string...) → string` *(variadic; ≥0 args)*               | `KindString`  | allocating   | Concatenates all args in order. Empty-arg case returns `""`. Pre-sizes the buffer to the sum of arg lengths. |
+| `url_decode`          | `(string) → string`                                        | `KindString`  | allocating   | `url.QueryUnescape`; malformed `%xx` → `""` (no error path on Eval signature). |
+| `url_encode`          | `(string) → string`                                        | `KindString`  | allocating   | `url.QueryEscape` (RFC 3986 query-string form; `/` is percent-encoded). |
+| `html_entity_decode`  | `(string) → string`                                        | `KindString`  | allocating   | `html.UnescapeString`; named and numeric entities; unknown entities pass through. |
+| `remove_bytes`        | `(string, string) → string`                                | `KindString`  | allocating   | Drops every byte of `s` that appears in `set`. Byte-level filter (not rune). Empty `set` returns `s` unchanged. |
+| `regex_replace`       | `(string, string, string) → string`                        | `KindString`  | allocating   | RE2 replacement. When the pattern is a string literal, the pattern is precompiled at compile time (D4) and reused per eval. Non-literal pattern compiles per call. Bad pattern → input string returned unchanged. |
+| `lookup_json_string`  | `(string, string) → string`                                | `KindString`  | allocating   | Parses the first arg as a top-level JSON object; returns the string value at `key`. Misses (invalid JSON, key absent, non-string value) → `""`. Non-string JSON values render via `fmt.Sprint` (e.g. `42` → `"42"`). |
+| `ip_to_int`           | `(ip) → int`                                               | `KindInt`     | alloc-free   | IPv4 → 32-bit network-byte-order int (zero-extended to int64). IPv6 → LOW 64 BITS as int64 (bit-interpreted; high bit set yields a negative int64). Nil/empty IP → 0. |
+| `cidr_matches`        | `(ip, string) → bool`                                      | `KindBool`    | alloc-free   | `net.IPNet.Contains(ip)`. When the CIDR arg is a string literal, `*net.IPNet` is resolved at compile time (D17) and `Contains` is called directly per eval — zero `ParseCIDR` per call. Non-literal CIDR parses per call. Malformed CIDR or nil IP → `false`. |
+| `now`                 | `() → timestamp`                                           | `KindTimestamp` | allocating | Current wall-clock time at eval; intentionally non-deterministic. |
+| `unix_time`           | `(timestamp) → int`                                        | `KindInt`     | alloc-free   | `t.Unix()` seconds since 1970-01-01 UTC. |
+| `format_time`         | `(timestamp, string) → string`                             | `KindString`  | allocating   | `time.Format` with the supplied layout. Empty layout → `time.RFC3339` (D20 fallback for unparameterised call sites). Bad layouts are caller error; Go returns a deterministic string for any input. |
+| `to_int`              | `(any) → int`                                              | `KindInt`     | alloc-free   | Per-Kind coercion (D19): Int→identity; Float→truncate toward zero, NaN/-Inf→`math.MinInt64`, +Inf→`math.MaxInt64`; String→`strconv.ParseInt(s, 10, 64)`, parse failure→0; Bool→1/0; IP→low 64 bits (matches `ip_to_int`); Timestamp→`t.Unix()`; Duration→`int64(d)` ns. Unsupported Kinds (Bytes/Array/Map/KindInvalid) → 0. |
+| `to_float`            | `(any) → float`                                            | `KindFloat`   | alloc-free   | Per-Kind coercion (D19): Float→identity; Int→`float64(i)`; String→`strconv.ParseFloat(s, 64)`, parse failure→0; Bool→1.0/0.0; IP→`float64(low 64 bits as uint64)`. Unsupported Kinds (Timestamp/Duration/Bytes/Array/Map/KindInvalid) → 0. |
+
+### Notes on the function table
+
+- **"Alloc-free" contract (D4 / D16).** The alloc-free flag means the
+  engine itself adds no per-call bookkeeping allocation beyond what the
+  stdlib operation inherently needs (e.g. `strings.ToLower` on a
+  mixed-case input). It does NOT mean the function never allocates
+  period. Allocating functions (`substring`, `concat`, `url_*`, etc.)
+  are benchmarked and labelled.
+- **Variadic only `concat`.** Every other function in v0.3.0 is
+  fixed-arity. The compiler enforces arity at compile time
+  (`code_bad_func_arity`).
+- **No public `Register`.** The registry is closed (D16 §5). Adding a
+  function in a future flow / version is a new entry in
+  `pkg/rule/compiler/functions.go` and a new case in
+  `compileFuncCall`'s dispatch — never a runtime `Register` call from
+  embedder code.
+- **`starts_with` / `ends_with` are NOT in this table** (DECISION D18).
+  They are operators (D14) and the lexer keyword-tokenises them before
+  the parser can see a function call. The operator form accepts a
+  function-call left operand: `lower(http.host) starts_with "www"`
+  compiles and evaluates as expected.
+- **Cross-links.** D16 (registry design, allocation contract), D17
+  (`*net.IPNet` compile-time resolution for `cidr_matches`), D18
+  (`starts_with` / `ends_with` as operators, not functions), D19 (the
+  per-Kind coercion semantics of `to_int` / `to_float`), D20 (`&`
+  bitmask operator and the `format_time` empty-layout fallback).
 
 ---
 
@@ -666,9 +765,9 @@ Compile errors are returned as `*compiler.CompileError` with `Code`,
 | `unknown_field`           | A `FieldRef.Name` does not exist in the active `Scheme`. Cross-namespace typos land here.                              |
 | `type_mismatch`           | Operand Kind is incompatible with the operator — e.g. `42 contains "x"`, `"a" eq 42`, ordering on non-Orderable Kind. |
 | `bad_regex`               | `matches` against a pattern that does not compile via `regexp.Compile`.                                                |
-| `unknown_function`        | A `FuncCall.Name` is not in the v1 function table (every FuncCall in v1 — table is empty).                            |
-| `bad_func_arity`          | Future: function called with wrong arg count. Reserved here for forward compatibility.                                |
-| `bad_func_arg_type`       | Future: function called with wrong arg Kind. Reserved.                                                                  |
+| `unknown_function`        | A `FuncCall.Name` is not in the v0.3.0 function table (DECISION D16). See [Functions](#functions).                       |
+| `bad_func_arity`          | Function called with the wrong number of arguments (D16). The minimum arity is enforced for variadic fns (`concat` requires ≥0 args; anything else with fewer than `len(ParamKinds) - (variadic?1:0)` fails here). |
+| `bad_func_arg_type`       | Per-argument Kind mismatch against `FuncSpec.ParamKinds` (D16). `KindInvalid` in ParamKinds means "any Kind" (used by `to_int` / `to_float` / `to_string`). |
 | `bad_array_element`       | Array literal contains a non-literal sub-expression that the compiler cannot const-fold (forward-compat hook).         |
 | `bad_strict_placement`    | `strict` modifier placed in a context without a binary-op parent — e.g. `strict (a or b)`.                            |
 | `bad_bracketaccess`       | Bracket-access operator: object not Map-typed, or key not string-typed.                                                 |
@@ -778,14 +877,6 @@ boolean and (optionally) the matched rule name; the embedding plugin
 chooses the action. Cookbook entries describe the action mapping on the
 plugin side (e.g. `Cookbook: custom-plugin.yaml` — generic tutorial).
 
-### User-callable functions (DECISION D14)
-
-Function table is empty. No `lower`, `upper`, `len`, etc. See
-[Functions](#functions).
-
-**Extension path:** add a case to the function table in
-`compileFuncCall` (Go-side) and document the signature here.
-
 ### HTTP-specific fields in `pkg/rule` (DECISION D7)
 
 `http.*` field names do NOT live in `arx-core/pkg/rule` — they belong to
@@ -821,6 +912,11 @@ source is not a v1 goal.
   custom-plugin wiring tutorial.
 - [`.opencode/flows/001_2026-06-25_universal-rule-engine/DECISIONS.md`](../../.opencode/flows/001_2026-06-25_universal-rule-engine/DECISIONS.md)
   — the architectural decisions that govern the engine.
+- [`.opencode/flows/002_2026-06-29_function-layer-and-hardening/DECISIONS.md`](../../.opencode/flows/002_2026-06-29_function-layer-and-hardening/DECISIONS.md)
+  — D16 (function registry), D17 (compile-time `*net.IPNet`),
+  D18 (`starts_with` / `ends_with` as operators), D19 (coercion
+  semantics for `to_int` / `to_float`), D20 (`&` bitmask operator and
+  `format_time` empty-layout fallback).
 - [`pkg/rule/types.go`](./types.go) — `Value`/`Kind` constructors.
 - [`pkg/rule/scheme.go`](./scheme.go) — `FieldType` re-export, `FieldInfo`,
   `Catalog`, `Scheme`.
