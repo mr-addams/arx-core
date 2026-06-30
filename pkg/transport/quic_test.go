@@ -182,6 +182,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -1168,29 +1169,48 @@ func TestDialSignedChallengeRejectsForgedKey(t *testing.T) {
 }
 
 // TestListenEmptyAddrErrors is the Q3 guard: a
-// Transport with an empty Listen field must fail
-// Listen with a clear, non-nil error.
+// Transport constructed with an explicit empty
+// Listen field should be rejected at New time by
+// K1's validation, before Listen can be called.
 //
-// Without this guard, Listen would call
-// quic.ListenAddr("", ...) which on Linux binds
-// to the wildcard address (port 0 OS-picked) —
-// a silent surprise for an operator who forgot
-// to set transport.listen. The error message is
-// the operator's first clue.
+// K1 changed the contract here. Under Q1 the
+// guard lived inside Listen itself (a defensive
+// check on the empty string). Under K1, New runs
+// applyDefaults + Validate, and an Enabled=true
+// config with Listen="" gets the built-in
+// loopback default (127.0.0.1:4097) — so by
+// the time a caller has a *Transport, the listen
+// field is never empty.
+//
+// The test's purpose in v0.1.0 is the K1
+// resolution: an Enabled=true Config with
+// Listen="" must still get a usable Transport
+// (applyDefaults fills it), and a Config that
+// somehow ends up with Listen="" after
+// resolution (theoretically reachable only via
+// direct field mutation, not through New) would
+// fail at Run / Listen. The Listen() guard is
+// preserved as defence-in-depth; the public
+// API is the resolution path.
 func TestListenEmptyAddrErrors(t *testing.T) {
 	dir := t.TempDir()
 	cfg := validConfig(t, dir)
 	cfg.Listen = "" // explicitly unset
+
+	// Under K1, New resolves Listen to the built-in
+	// default. The Transport's listen field is
+	// therefore non-empty after New returns.
 	tr, err := New(cfg)
 	if err != nil {
-		t.Fatalf("New with empty Listen: %v", err)
+		t.Fatalf("New with empty Listen (and no env): %v", err)
 	}
-	err = tr.Listen(context.Background())
-	if err == nil {
-		t.Fatal("Listen on empty addr returned nil error; expected an explicit guard")
+	if tr.listen == "" {
+		t.Fatal("New left t.listen empty; applyDefaults should have filled the default")
 	}
-	if !strings.Contains(err.Error(), "Listen") {
-		t.Errorf("error %q does not mention Listen; operator-diagnostics gate", err.Error())
+	// Sanity: the filled value is the default.
+	if tr.listen != defaultListenAddr {
+		t.Errorf("New with empty Listen filled %q; want %q (the built-in default)",
+			tr.listen, defaultListenAddr)
 	}
 }
 
@@ -1893,4 +1913,354 @@ func TestDialForgedKeyEndToEnd(t *testing.T) {
 	if ln == nil {
 		t.Error("server listener was cleared by the rejected handshake; accept loop must survive a hard-reject")
 	}
+}
+
+// ========================== K2 — Run enabled-gate regression tests ==========================
+//
+// K2 ships the D21 security gate: when the transport is disabled,
+// Run is provably side-effect-free. The tests below pin the contract
+// from multiple angles:
+//
+//   - Runtime.NumGoroutine snapshot (no new goroutine was spawned).
+//   - listenFunc spy (the listener-construction path was not invoked).
+//   - Transport.listener field (no listener was bound).
+//   - Return value (nil, returned promptly).
+//
+// The "spy listenFunc" pattern is the K2-specific injection point
+// added in this task. The test installs a closure that records the
+// call and returns a sentinel error; production code never invokes
+// it because the disabled path short-circuits before listenFunc is
+// called. The "K2 disabled" assertion is therefore "the spy was not
+// invoked", which is the provable property D21 demands.
+//
+// All tests are hermetic (no network — the disabled path never
+// touches quic.ListenAddr). Goroutine count assertions use a small
+// tolerance (±2) to absorb test-framework noise (a parallel test
+// that briefly starts a goroutine, a finalizer, etc.). The exact
+// tolerance is documented per-test.
+
+// recordingListenFunc returns a listenFunc replacement that
+// records every call and returns a sentinel error. K2 tests
+// install this on Transport.listenFunc; the "disabled path
+// did not invoke listenFunc" assertion is then a simple
+// "called == false" check.
+type recordingListenFunc struct {
+	called bool
+}
+
+func (r *recordingListenFunc) spy(ctx context.Context, t *Transport) (*quic.Listener, error) {
+	r.called = true
+	return nil, errors.New("recordingListenFunc: deliberately not bound")
+}
+
+// TestRunDisabledReturnsImmediately: Run on a Transport
+// constructed with Enabled=false returns nil quickly,
+// with no error.
+//
+// "Quickly" is bounded by 50ms — a generous upper bound
+// for a function whose only work is a boolean check and
+// a return. A buggy implementation that called quic.ListenAddr
+// or spawned a goroutine before the check would take
+// observably longer (the real listener-bind path is on
+// the order of tens of milliseconds; a goroutine spawn
+// is microseconds but the runtime.NumGoroutine check
+// in the next test would catch it).
+func TestRunDisabledReturnsImmediately(t *testing.T) {
+	var cfg Config // zero value: Enabled=false
+
+	tr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(zero-value Config) returned %v; D21 promise says disabled is always valid", err)
+	}
+
+	// Install the spy BEFORE calling Run, so any call into
+	// listenFunc is observable.
+	spy := &recordingListenFunc{}
+	tr.listenFunc = spy.spy
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	start := time.Now()
+	if err := tr.Run(ctx); err != nil {
+		t.Errorf("Run(disabled) returned %v; expected nil", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("Run(disabled) took %v; expected < 50ms (the disabled path should be near-instant)", elapsed)
+	}
+}
+
+// TestRunDisabledCreatesNoGoroutine: Run on a disabled
+// Transport creates no new goroutine. This is the
+// runtime-level D21 gate; combined with
+// TestRunDisabledBindsNoUDPPort (the listener-side gate),
+// the disabled path is provably side-effect-free.
+//
+// Tolerance: ±2 goroutines. The Go test framework may have
+// background goroutines (signal handling, GC assist, etc.)
+// and a parallel test in the same package may have started
+// or stopped goroutines between the two snapshots. A
+// tolerance of 2 absorbs this noise; the disabled-path
+// claim is "no NEW transport-owned goroutine", not
+// "runtime.NumGoroutine is byte-identical before and after".
+func TestRunDisabledCreatesNoGoroutine(t *testing.T) {
+	var cfg Config // disabled
+
+	tr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(zero-value Config) returned %v", err)
+	}
+	spy := &recordingListenFunc{}
+	tr.listenFunc = spy.spy
+
+	// Settle the runtime. A freshly-started test may have
+	// a non-steady-state goroutine count (GC, package
+	// init, etc.). A short sleep + a small warm-up call
+	// to runtime.Gosched gives the scheduler a chance
+	// to reach a stable count before we snapshot.
+	runtimeGosched()
+
+	before := runtimeNumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := tr.Run(ctx); err != nil {
+		t.Errorf("Run(disabled) returned %v", err)
+	}
+
+	// Small delay to let any "wrong" goroutine have
+	// time to materialise. The disabled path should
+	// not start any, so this delay is insurance; a
+	// correct implementation shows no change.
+	time.Sleep(20 * time.Millisecond)
+
+	after := runtimeNumGoroutine()
+
+	delta := after - before
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > 2 {
+		t.Errorf("Run(disabled) created %d new goroutines (before=%d, after=%d); D21 promise says zero",
+			delta, before, after)
+	}
+}
+
+// TestRunDisabledBindsNoUDPPort: Run on a disabled Transport
+// leaves Transport.listener == nil. The listener field is
+// the runtime's "is the QUIC socket bound?" signal; asserting
+// it is nil after Run is the listener-side D21 gate.
+//
+// The check is taken under listenerMu because the field is
+// guarded by that lock in the Q3 Listen path; the disabled
+// path never takes the lock, so a nil read is safe either
+// way, but using the lock keeps the test pattern aligned
+// with how a future Close path would read the field.
+func TestRunDisabledBindsNoUDPPort(t *testing.T) {
+	var cfg Config
+
+	tr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(zero-value Config) returned %v", err)
+	}
+	spy := &recordingListenFunc{}
+	tr.listenFunc = spy.spy
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := tr.Run(ctx); err != nil {
+		t.Errorf("Run(disabled) returned %v", err)
+	}
+
+	tr.listenerMu.Lock()
+	ln := tr.listener
+	tr.listenerMu.Unlock()
+	if ln != nil {
+		t.Errorf("Run(disabled) bound a listener; expected Transport.listener to remain nil")
+	}
+}
+
+// TestRunDisabledDoesNotInvokeListen: the K2 listenFunc
+// spy was not invoked. This is the strongest D21
+// assertion: the listener-construction path was not
+// even reached, let alone the bind syscall.
+func TestRunDisabledDoesNotInvokeListen(t *testing.T) {
+	var cfg Config
+
+	tr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(zero-value Config) returned %v", err)
+	}
+	spy := &recordingListenFunc{}
+	tr.listenFunc = spy.spy
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := tr.Run(ctx); err != nil {
+		t.Errorf("Run(disabled) returned %v", err)
+	}
+
+	if spy.called {
+		t.Error("Run(disabled) invoked listenFunc; D21 promise says listener-construction is skipped when disabled")
+	}
+}
+
+// TestRunEnabledButMissingListenErrors: Run on an
+// Enabled=true Transport whose listen value was cleared
+// after New returns a non-nil error WITHOUT invoking
+// listenFunc and WITHOUT starting a goroutine. This
+// pins the defence-in-depth: the runtime re-validates
+// after New, and a state mismatch (e.g. t.listen
+// cleared between New and Run) is a loud failure that
+// does not silently start a half-configured runtime.
+//
+// The test directly mutates tr.listen to empty,
+// bypassing New's applyDefaults. This simulates a
+// future caller that programmatically mutates the
+// transport state — exactly the wire-up bug the
+// re-validation step is designed to catch.
+func TestRunEnabledButMissingListenErrors(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Enabled:        true,
+		IdentityPath:   filepath.Join(dir, "node.key"),
+		KnownNodesPath: filepath.Join(dir, "known-nodes"),
+		Listen:         "127.0.0.1:0",
+	}
+
+	tr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(valid Config) returned %v", err)
+	}
+	spy := &recordingListenFunc{}
+	tr.listenFunc = spy.spy
+
+	// Clear the listen field after New. The re-validation
+	// step in Run should catch this and return an error
+	// before touching listenFunc.
+	tr.listen = ""
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := tr.Run(ctx); err == nil {
+		t.Error("Run with cleared listen returned nil; expected an error from post-construction validation")
+	}
+	if spy.called {
+		t.Error("Run with cleared listen invoked listenFunc; validation should have rejected before listener construction")
+	}
+}
+
+// TestRunEnabledInvokesListenAndBlocksUntilCancel: the
+// happy-path K2 test. Run on an Enabled=true Transport
+// calls listenFunc, starts the accept loop, blocks until
+// ctx is cancelled, then returns nil. The listener
+// remains in place after Run returns (cancellation
+// tears down the loop but the *quic.Listener field is
+// not explicitly cleared by Run — a Close / shutdown
+// method would be the right place to clear it, and
+// that is a future flow task).
+//
+// This test uses the real defaultListenFunc (the
+// production quic.ListenAddr path), so it IS a real
+// network test (it binds 127.0.0.1:0). The
+// "run-test-in-parallel" warning is fine: each test
+// binds a different port (the OS picks 0).
+func TestRunEnabledInvokesListenAndBlocksUntilCancel(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		Enabled:        true,
+		IdentityPath:   filepath.Join(dir, "node.key"),
+		KnownNodesPath: filepath.Join(dir, "known-nodes"),
+		Listen:         "127.0.0.1:0", // OS-picked port
+	}
+
+	tr, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New(valid Config) returned %v", err)
+	}
+
+	// Sanity: the production listenFunc is in place
+	// (New sets it). We do NOT override it — this
+	// test exercises the real listener-construction
+	// path, not a spy.
+	if tr.listenFunc == nil {
+		t.Fatal("New left listenFunc nil; production wire-up requires defaultListenFunc")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Run blocks. We drive it from a goroutine so the
+	// test can cancel ctx and wait for the return.
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- tr.Run(ctx)
+	}()
+
+	// Wait briefly for Run to bind the listener and
+	// start the accept loop. The OS-pick of port 0
+	// resolves within milliseconds on a healthy system;
+	// 200ms is a generous upper bound that catches
+	// real bugs (e.g. listenFunc returns an error)
+	// without being flaky on slow CI.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	var ln *quic.Listener
+	for time.Now().Before(deadline) {
+		tr.listenerMu.Lock()
+		ln = tr.listener
+		tr.listenerMu.Unlock()
+		if ln != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ln == nil {
+		cancel()
+		<-runDone
+		t.Fatal("Run(enabled) did not populate Transport.listener within 200ms; listenFunc may have failed silently")
+	}
+
+	// Cancel ctx; Run should return nil. The accept
+	// loop's ctx-cancel path closes the listener, so
+	// we expect the listener to be Closed but not nil
+	// (Run does not clear the field on cancel).
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("Run(enabled) returned %v on cancel; expected nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run(enabled) did not return within 2s of ctx cancel")
+	}
+}
+
+// runtimeNumGoroutine returns runtime.NumGoroutine().
+//
+// The function is a thin indirection so a future test
+// that needs to swap in a fake counter (e.g. for
+// reproducible benchmarking) has a single point of
+// override. The K2 goroutine-count tests call it via
+// the wrapper rather than reaching into runtime
+// directly, which keeps the test code uniform.
+func runtimeNumGoroutine() int {
+	return runtime.NumGoroutine()
+}
+
+// runtimeGosched yields the processor to allow other
+// goroutines to run. The K2 goroutine-count tests call
+// it before snapshotting runtime.NumGoroutine so the
+// scheduler has a chance to reach a steady state. The
+// call is intentionally NOT a sleep: a sleep would
+// add flakiness on slow machines, whereas a single
+// Gosched is a no-op on a quiet runtime and a useful
+// "let the scheduler catch up" on a busy one.
+func runtimeGosched() {
+	runtime.Gosched()
 }

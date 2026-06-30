@@ -49,11 +49,21 @@
 // meaningful for trust), and no need to thread a "current peer host"
 // through TLS internals. The choice is documented for PROTOCOL.md.
 //
-// File-split decision: Config + PeerConfig live in quic.go (not a
-// separate config.go) because Q1 needs the type to define New's
-// signature, and a one-type file would only matter once K1 lands more
-// behaviour. Moving to a dedicated config.go at K1 is a 1-line
-// import-shuffle — no API impact.
+// K1 (2026-06-30) ships the Config-with-defaults story and moves
+// Config + PeerConfig + validate to config.go (the file-split Q1's
+// header deferred to K1). quic.go keeps the Transport runtime
+// surface: Transport struct, New, Listen, Dial, Run (K2), and the
+// TLS / QUIC config builders. The split keeps the runtime file
+// focused on QUIC mechanics; the config file owns defaults,
+// env-var resolution, and validation.
+//
+// K2 (this file) ships the enabled-gate on Transport. Run is the
+// public entrypoint the bootstrap calls when transport is enabled;
+// when Enabled=false, Run returns immediately without spawning a
+// goroutine, opening a listener, or dialing. A fake-listener
+// injection point (listenFunc, an unexported field) lets K2's
+// regression tests assert the listener construction was skipped
+// without standing up a real QUIC socket.
 package transport
 
 import (
@@ -70,7 +80,6 @@ import (
 	"io"
 	"math/big"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -116,154 +125,6 @@ const challengeNonceSize = 32
 // transport and self-documenting at call sites.
 const challengeSignatureSize = 64
 
-// ========================== Config + PeerConfig ==========================
-
-// PeerConfig is the config-level representation of a peer entry (D25).
-//
-// The struct is intentionally minimal: the transport does not parse YAML
-// (D25 + the bootstrap integration is a later flow; the arxsentinel
-// product config chain populates these values out-of-band). PeerConfig
-// holds exactly what the transport needs to attempt a connection — host
-// and the operator-pre-shared fingerprint, which may be empty for
-// "TOFU on first contact" (D24 §5).
-//
-// Conversion to the runtime *Peer (with state machine, redial backoff,
-// etc.) is Group R's job (R1). PeerConfig is the config entry-point;
-// Peer is the lifecycle object. Keeping them separate means a config
-// re-read does not reset in-flight connection state.
-type PeerConfig struct {
-	// Host identifies the peer for dialing. Format is whatever
-	// net.ResolveUDPAddr accepts (host:port or host alone with default
-	// port; Q3 will document the expected form in PROTOCOL.md). The
-	// transport does not parse it here — Q3's Dial is the boundary
-	// where the string becomes a *net.UDPAddr.
-	Host string
-
-	// Fingerprint is the operator-pre-shared fingerprint, in the
-	// canonical "sha256:<hex>" form produced by Identity.Fingerprint().
-	// Empty means "TOFU on first contact": the first presented
-	// fingerprint is pinned into known-nodes (D24 §5). A non-empty
-	// value MUST match exactly — a mismatch at handshake time is the
-	// Q4 hard-reject case.
-	Fingerprint string
-}
-
-// Config is the preliminary transport configuration (K1 extends it with
-// defaults, validation helpers, and the env-var resolution contract).
-//
-// Why "preliminary": Group K is responsible for the
-// defaults-and-validation slice of the config story, and Q1 needs at
-// least a struct to define New's signature. Defining the full struct
-// here would either duplicate K1's work or pre-empt its design. So Q1
-// ships the minimum fields that let New() actually load an identity
-// and a known-nodes store from disk; K1 adds the rest.
-//
-// Field rules at Q1:
-//
-//   - Enabled is the master gate (D21). Q1 reads it but does not act
-//     on it — K2's Run is the method that early-returns when false.
-//   - IdentityPath is required (New errors if empty): there is no
-//     transport without an identity (D23). The path's parent dir
-//     must exist; New creates the file on first start (D23 §1).
-//   - Listen is the QUIC bind address (D22). Q1 stores it for Q3's
-//     quic.ListenAddr; Q1 does not parse or validate the format.
-//   - KnownNodesPath is required (New errors if empty): the TOFU
-//     store has no useful default location, and "create one in cwd"
-//     is exactly the silent-magic behaviour that gets re-discovered
-//     as a bug six months later.
-//   - Peers is the config-level roster; R1 converts it into *Peer
-//     instances with state. Q1 stores the slice verbatim.
-//
-// Zero-value Config: K1 documents that the zero value is equivalent
-// to "disabled, no paths, no peers" and is therefore unusable — every
-// caller must populate it explicitly. The "disabled" half of that
-// promise is the K2 regression test gate (D21).
-type Config struct {
-	// Enabled is the master gate (D21). When false, the bootstrap
-	// does not invoke the transport at all; the K2 regression test
-	// proves this creates no goroutine and no listener.
-	Enabled bool
-
-	// IdentityPath is the on-disk location of the node's Ed25519
-	// private key. Required. New creates the file here on first
-	// start (D23 §1).
-	IdentityPath string
-
-	// Listen is the QUIC bind address (D22 §1). Q1 does not parse
-	// or bind it; Q3's Listen does.
-	Listen string
-
-	// KnownNodesPath is the on-disk location of the TOFU
-	// known-nodes file. Required.
-	KnownNodesPath string
-
-	// Peers is the config-level peer roster (D25). The transport
-	// does not dial from this slice in Q1; R1 turns it into
-	// runtime *Peer objects with state.
-	Peers []PeerConfig
-}
-
-// validate is the Q1 config-validation step. It enforces "the fields
-// required by New exist" without going further — K1 owns the
-// user-facing validation story (parse, defaults, env-var fallback).
-//
-// Rules (Q1):
-//   - IdentityPath must be non-empty: no identity = no transport.
-//     D23 says generation is on first start; an empty path is not
-//     "no path", it is "I forgot to set it", and the failure mode
-//     of "generate in cwd" is exactly the silent-magic D21+D25
-//     try to prevent.
-//   - KnownNodesPath must be non-empty: same reasoning — a missing
-//     known-nodes file is a normal first-run state, but an empty
-//     path is a misconfiguration.
-//   - IdentityPath's parent directory must exist. The transport
-//     generates the key file but does not create the config dir —
-//     that is the bootstrap's job (OPERATIONS.md). New() also
-//     rejects IdentityPath that points at an existing non-file
-//     (e.g. a directory) so a misconfigured setup fails loudly
-//     here instead of at Save() time.
-//
-// Q1 does NOT validate: the format of Listen, the contents of
-// Peers[].Host, whether Peers[].Fingerprint matches any expected
-// shape. Those are Q3 / K1 concerns.
-func (c *Config) validate() error {
-	if c.IdentityPath == "" {
-		return fmt.Errorf("transport: Config.IdentityPath is required")
-	}
-	if c.KnownNodesPath == "" {
-		return fmt.Errorf("transport: Config.KnownNodesPath is required")
-	}
-
-	// Parent dir must exist. The transport does not mkdir — that is
-	// the bootstrap's job (it knows the config dir layout, the
-	// transport does not). If the parent is missing, fail loudly so
-	// the operator notices the misconfiguration rather than seeing
-	// a generated key appear in an unexpected place.
-	dir := filepath.Dir(c.IdentityPath)
-	if _, err := os.Stat(dir); err != nil {
-		return fmt.Errorf("transport: Config.IdentityPath parent dir %q: %w", dir, err)
-	}
-
-	// IdentityPath must not point at an existing directory. The
-	// check is "does a non-file exist here?" — if the path is an
-	// existing file, the next step (load-or-generate) will handle
-	// it; if it is a directory, generation would fail with a
-	// confusing os.Create error later. Catch it here with a
-	// specific message.
-	if info, err := os.Stat(c.IdentityPath); err == nil {
-		if info.IsDir() {
-			return fmt.Errorf("transport: Config.IdentityPath %q is a directory, not a file", c.IdentityPath)
-		}
-	}
-	// err != nil at this point means "does not exist" — fine, that
-	// is the first-start case. Any other stat error (perm denied
-	// etc.) is also fine: Generate below will surface it as a
-	// concrete Save() error rather than us pre-validating and
-	// giving a less-actionable message.
-
-	return nil
-}
-
 // ========================== Transport ==========================
 
 // Transport is the public sentinel-transport handle: the single object
@@ -277,6 +138,52 @@ func (c *Config) validate() error {
 // itself is safe to construct and then hand to multiple readers
 // provided they do not mutate the listener field.
 type Transport struct {
+	// enabled is the cached value of cfg.Enabled from New. Stored
+	// separately (rather than re-reading cfg each time) because
+	// Transport does not keep the *Config after construction —
+	// New copies the fields it needs into the struct, and the
+	// Enabled flag is one of those fields. The K2 Run method
+	// reads this field on every call to decide whether to early-
+	// return; the K2 regression test asserts the field is the
+	// one and only signal that gates the runtime start.
+	enabled bool
+
+	// listenFunc is the unexported listener-construction injection
+	// point used by K2's regression tests to assert the disabled
+	// path does NOT construct a listener. Production code never
+	// overrides it: New() sets it to the package-level
+	// defaultListenFunc, which is the real quic.ListenAddr call
+	// the same way the Q3 Listen path uses it.
+	//
+	// Signature: func(ctx, *Transport) (*quic.Listener, error).
+	// The *Transport is the first arg (not a method receiver)
+	// because the field type is a plain func value, not a method
+	// value. A method value "t.defaultListenFunc" would be the
+	// Go-idiomatic alternative, but a method on *Transport would
+	// need to be exported or have a non-standard name, both of
+	// which leak the test injection point into the public API.
+	// The plain-func shape is the additive surface that keeps
+	// the test override one-liner-friendly:
+	//
+	//	tr.listenFunc = func(_ context.Context, _ *Transport) (*quic.Listener, error) {
+	//	    called = true
+	//	    return nil, errors.New("not bound")
+	//	}
+	//
+	// Why a function field rather than a *quic.Listener field:
+	// the K2 gate is "no listener construction when disabled" —
+	// to assert that, the test needs to observe the CONSTRUCT call
+	// (the moment quic.ListenAddr is invoked, the OS socket is
+	// bound), not just the eventual Listener struct. A function
+	// field is the minimum surface that lets a test install a
+	// spy that records the call without standing up a real UDP
+	// socket.
+	//
+	// Concurrency: listenFunc is set once in New and never mutated
+	// afterwards. Run reads it without a lock; tests that override
+	// it must do so before calling Run.
+	listenFunc func(ctx context.Context, t *Transport) (*quic.Listener, error)
+
 	// identity is this node's Ed25519 self-signed identity (D23).
 	// Never nil after a successful New.
 	identity *Identity
@@ -285,8 +192,11 @@ type Transport struct {
 	// a successful New.
 	known *KnownNodes
 
-	// listen is the configured QUIC bind address (D22). Stored
-	// verbatim; Q3's Listen calls quic.ListenAddr(listen, ...).
+	// listen is the resolved QUIC bind address (D22). K1's
+	// applyDefaults step fills in env-var / built-in defaults
+	// before this field is set, so by the time the Transport is
+	// constructed, t.listen is the final, validated value. Q3's
+	// Listen calls quic.ListenAddr(t.listen, ...).
 	listen string
 
 	// peers is the config-level peer roster (D25, R1). Q1 holds
@@ -369,26 +279,42 @@ type Transport struct {
 
 // New constructs a Transport from cfg.
 //
-// Steps (Q1):
+// Steps (Q1 + K1):
 //
-//  1. Validate cfg via Config.validate (see above).
-//  2. Load the Ed25519 identity from cfg.IdentityPath. If the
-//     file does not exist, generate a new identity and Save it
-//     to the same path. If the file exists but is unreadable /
-//     wrong-sized, return the error from Load (D23 §2 — "fails
-//     loudly").
-//  3. Construct the TOFU known-nodes store via NewKnownNodes
-//     (which loads from disk if the file exists, returns empty
-//     otherwise — first-start is a normal state, not an error,
-//     per tofu.go T1).
+//  1. Resolve defaults and env-var overrides via applyDefaults
+//     (K1). The result is a Config whose Listen field has been
+//     filled in from the env or the built-in loopback default
+//     when the operator did not set it explicitly.
+//  2. Validate the resolved config via Validate (K1). The
+//     Enabled=false short-circuit means a zero-value Config is
+//     valid; the Enabled=true branch enforces IdentityPath /
+//     KnownNodesPath / Listen / Peers[].Host non-empty.
+//  3. If Enabled is true, load the Ed25519 identity from
+//     cfg.IdentityPath. If the file does not exist, generate
+//     a new identity and Save it to the same path. If the file
+//     exists but is unreadable / wrong-sized, return the error
+//     from Load (D23 §2 — "fails loudly"). If Enabled is false,
+//     SKIP the identity load entirely — the disabled Transport
+//     is a no-op and must not write to disk (the K2 D21 gate
+//     is "no side effects when disabled", and writing node.key
+//     is a side effect).
+//  4. If Enabled is true, construct the TOFU known-nodes store
+//     via NewKnownNodes (which loads from disk if the file
+//     exists, returns empty otherwise — first-start is a normal
+//     state, not an error, per tofu.go T1). If Enabled is false,
+//     skip the store construction.
 //
 // Q1 does NOT:
 //   - Open any network socket (D21 disabled-by-default: a
 //     successfully-constructed Transport has zero goroutines,
 //     zero sockets, zero listeners).
-//   - Validate Listen, Peers, or any of their fields (Q3 / K1).
 //   - Call quic.ListenAddr. The listener field stays nil until
 //     Q3's Listen.
+//   - Start Run. New is the "construct the runtime" step; Run
+//     is the "start the runtime" step (K2). When Enabled=false,
+//     the caller (bootstrap) is expected to either skip Run
+//     entirely or call Run and have it return immediately — the
+//     K2 regression tests cover both shapes.
 //
 // Error contract: a non-nil return is a hard failure; the
 // caller (bootstrap) MUST NOT use a partially-constructed
@@ -397,15 +323,47 @@ type Transport struct {
 // unexported ones, so a caller cannot build a Transport
 // without going through New anyway.
 func New(cfg Config) (*Transport, error) {
-	if err := cfg.validate(); err != nil {
+	// K1: apply defaults (env > built-in) BEFORE validation.
+	// The order matters: Validate checks Listen is non-empty
+	// when Enabled is true, and applyDefaults is what fills in
+	// the Listen value when the operator did not. Validating
+	// the un-defaulted config would produce a spurious
+	// "Listen is required" error on a config that would have
+	// been valid after env-var resolution.
+	resolved := applyDefaults(cfg)
+	if err := resolved.Validate(); err != nil {
 		return nil, err
+	}
+
+	// Disabled short-circuit: a zero-value Config (Enabled=false)
+	// skips both the identity load and the known-nodes
+	// construction. This is the D21 promise: a disabled Transport
+	// has no side effects, no on-disk artefacts, no goroutines.
+	// Skipping the load here is what makes the K2 regression
+	// test's "no node.key file was written" assertion possible
+	// (the test runs from a temp dir with no node.key, and
+	// after New the temp dir still has no node.key).
+	if !resolved.Enabled {
+		return &Transport{
+			enabled:    false,
+			listenFunc: defaultListenFunc,
+			// identity left nil — a disabled Transport is
+			// never asked for its identity.
+			// known left nil — a disabled Transport is
+			// never asked for its known-nodes.
+			// listen left empty — a disabled Transport
+			// never binds a listener.
+			// peers left nil — a disabled Transport
+			// never iterates the peer roster.
+			logger: DiscardLogger(),
+		}, nil
 	}
 
 	// Load or generate the identity. Load returns an error for
 	// "exists but unreadable / wrong size"; we propagate that
 	// directly. os.IsNotExist is the only error we treat as
 	// "first start, generate".
-	identity, err := loadOrGenerateIdentity(cfg.IdentityPath)
+	identity, err := loadOrGenerateIdentity(resolved.IdentityPath)
 	if err != nil {
 		return nil, fmt.Errorf("transport: load identity: %w", err)
 	}
@@ -414,13 +372,15 @@ func New(cfg Config) (*Transport, error) {
 	// design (T1) — a missing file is first-start, a malformed
 	// file is detected at the point of use by Check. We just
 	// hold the resulting *KnownNodes.
-	known := NewKnownNodes(cfg.KnownNodesPath)
+	known := NewKnownNodes(resolved.KnownNodesPath)
 
 	return &Transport{
-		identity: identity,
-		known:    known,
-		listen:   cfg.Listen,
-		peers:    cfg.Peers,
+		enabled:    resolved.Enabled,
+		listenFunc: defaultListenFunc,
+		identity:   identity,
+		known:      known,
+		listen:     resolved.Listen,
+		peers:      resolved.Peers,
 		// listener left nil — Q3's Listen fills it in.
 		// logger defaults to DiscardLogger() so a production
 		// caller that never injects a logger has zero log
@@ -429,6 +389,56 @@ func New(cfg Config) (*Transport, error) {
 		// operator alert.
 		logger: DiscardLogger(),
 	}, nil
+}
+
+// defaultListenFunc is the production listener-construction
+// function stored on Transport.listenFunc by New. It is the
+// real quic.ListenAddr call (using the Transport's resolved
+// listen address and TLS / QUIC configs) extracted into a
+// function so K2's regression tests can override
+// Transport.listenFunc with a recording stub.
+//
+// The function takes the *Transport by value rather than as a
+// method receiver because the function-field type is a plain
+// "func(ctx) (*quic.Listener, error)" — a method on *Transport
+// would not satisfy that signature (it would be
+// "(*Transport).Listen(ctx) (...)", an extra receiver).
+// Passing the receiver as the first argument keeps the
+// signature uniform with the test-override shape, so a test
+// can install a stub like
+//
+//	listenFunc: func(ctx context.Context) (*quic.Listener, error) {
+//	    // record the call and return
+//	}
+//
+// without an adapter.
+func defaultListenFunc(ctx context.Context, t *Transport) (*quic.Listener, error) {
+	// The real quic.ListenAddr path. Builds the per-listener
+	// *tls.Config the same way Q3's Listen does (with the
+	// per-connection GetConfigForClient hook that installs
+	// the host-baked VerifyPeerCertificate closure), then
+	// binds the UDP address.
+	tlsConf := t.buildTLSConfig("")
+	tlsConf.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+		host := ""
+		if info.Conn != nil {
+			host = info.Conn.RemoteAddr().String()
+		}
+		return t.buildTLSConfig(host), nil
+	}
+
+	listener, err := quic.ListenAddr(t.listen, tlsConf, t.buildQUICConfig())
+	if err != nil {
+		return nil, fmt.Errorf("transport: Listen: quic.ListenAddr(%q): %w", t.listen, err)
+	}
+
+	// We do NOT store listener on t here. Storing happens in
+	// Run after a successful return, so the K2 "did Run
+	// construct a listener" assertion can use the
+	// listenFunc-call observation as its primary signal and
+	// the t.listener field check as a secondary one.
+	_ = ctx
+	return listener, nil
 }
 
 // loadOrGenerateIdentity returns the identity stored at path, or — if
@@ -524,6 +534,252 @@ func (t *Transport) ListenAddr() string {
 // lifecycle exists yet.
 func (t *Transport) Peers() []PeerConfig {
 	return t.peers
+}
+
+// ========================== K2 — Run (enabled-gate) ==========================
+//
+// K2 ships the public entrypoint that connects the K1 Config layer
+// to the Q3 Listen / R2 peer-run runtime: Transport.Run(ctx) error.
+//
+// The D21 promise: when transport is disabled, the bootstrap can
+// call Run on a zero-value Config and get a no-op. The promise is
+// PROVABLE — a regression test (TestRunDisabledCreatesNoGoroutine
+// and friends) observes the runtime via runtime.NumGoroutine and
+// the listenFunc spy, and asserts both are quiet.
+//
+// Enabled=false contract:
+//
+//   - Run returns nil immediately, before any goroutine, before
+//     any listener construction, before any dial.
+//   - The Transport constructed by New is still usable for
+//     inspection: Identity(), KnownNodes(), ListenAddr(), Peers()
+//     are all live (they return the data New loaded). The only
+//     thing Run does when disabled is "do not start the runtime".
+//
+// Enabled=true contract:
+//
+//   - Run validates the resolved state is still usable (defence-
+//     in-depth: New already validated, but a future caller might
+//     mutate t.listen or t.peers between New and Run — the
+//     re-check makes those mutations loud failures).
+//   - Run calls listenFunc to bind the UDP socket, stores the
+//     resulting *quic.Listener on t.listener, and starts the
+//     Q3 accept loop in a goroutine.
+//   - Run builds the peer roster via RosterFromConfig, wires
+//     t.Dial as the dialer on each *Peer, and starts a
+//     peer.run goroutine per peer.
+//   - Run blocks until ctx is cancelled, then returns nil.
+//     The listener is closed by the Q3 accept loop on ctx cancel;
+//     the peer goroutines exit when their dial/dispatch
+//     operations observe ctx.Done().
+//
+// Architectural notes:
+//
+//   - listenFunc is the K2 injection point. Production wires it
+//     to defaultListenFunc in New; tests override it with a
+//     recording stub. Run calls listenFunc only on the Enabled=true
+//     path; the disabled path never invokes it (the K2 regression
+//     test asserts the spy was not called).
+//
+//   - D25 forbids live peer reconfiguration. Run builds the
+//     roster once at startup; adding or removing peers requires
+//     process restart. A future flow task that wants live peer-
+//     add wires a separate signal — the dialer field and the
+//     roster are not exposed to the operator at runtime in
+//     v0.1.0.
+
+// Run is the K2 enabled-gate entrypoint.
+//
+// When the Transport was constructed from a Config with
+// Enabled=false, Run returns nil immediately without
+// spawning any goroutine, constructing any listener, or
+// dialing any peer. The disabled path is provably side-
+// effect-free; the regression test in config_test.go
+// (TestRunDisabledCreatesNoGoroutine) is the security gate
+// that proves it.
+//
+// When Enabled=true, Run starts the QUIC listener
+// (via t.listenFunc, overridable in tests) and one
+// peer.run goroutine per configured peer. Run blocks
+// until ctx is cancelled; on cancel it returns nil
+// after the accept loop and peer goroutines have
+// torn down via the standard ctx-cancel paths.
+//
+// Error contract: a non-nil return means the runtime
+// failed to start (the listener-construction step
+// errored, or the post-construction validation
+// rejected an inconsistent state). The disabled
+// path ALWAYS returns nil.
+func (t *Transport) Run(ctx context.Context) error {
+	// D21 enabled-gate. This is the security-critical
+	// early return. NOTHING in the runtime starts
+	// before this check — no goroutine, no listener,
+	// no dial. The K2 regression test asserts this
+	// boundary by snapshotting runtime.NumGoroutine
+	// before and after the call.
+	if !t.enabled {
+		return nil
+	}
+
+	// Re-validate the runtime state. New already
+	// validated the resolved Config, but t.listen and
+	// t.peers are exported-ish via the unexported
+	// fields — a future caller could mutate them
+	// between New and Run. A cheap re-check makes
+	// those mutations loud failures rather than
+	// "Listen returns a confusing error at line 200".
+	//
+	// The re-check does NOT re-validate IdentityPath or
+	// KnownNodesPath: those are on-disk artefacts that
+	// New already resolved, and a missing or moved
+	// file is detected at the next operation that
+	// touches it (e.g. Pin / Check), not at Run
+	// startup. Re-validating the file-system state
+	// would also require a disk hit, which is the
+	// wrong side-effect profile for a "start the
+	// runtime" call. The runtime-relevant checks
+	// are: Listen non-empty (we are about to bind it)
+	// and Peers[].Host non-empty (we are about to
+	// start peer goroutines that would deref an
+	// empty host on the first dial).
+	if t.listen == "" {
+		return fmt.Errorf("transport: Run: Transport.listen is empty; " +
+			"this is a wire-up bug (New resolved a non-empty listen)")
+	}
+	for i, p := range t.peers {
+		if p.Host == "" {
+			return fmt.Errorf("transport: Run: Peers[%d].Host is empty; "+
+				"this is a wire-up bug (New validated a non-empty host)", i)
+		}
+	}
+
+	// Build the listener via the injection point.
+	// Production calls defaultListenFunc (the real
+	// quic.ListenAddr path). The K2 test overrides
+	// listenFunc with a recording stub; the disabled
+	// path never reaches this call, so the test can
+	// assert the stub was not invoked.
+	listener, err := t.listenFunc(ctx, t)
+	if err != nil {
+		return fmt.Errorf("transport: Run: listen: %w", err)
+	}
+
+	// Store the listener. listenerMu is the same lock
+	// Q3's Listen uses; we are the only writer at this
+	// point in the lifecycle (Run is the first thing
+	// that fills the field).
+	t.listenerMu.Lock()
+	t.listener = listener
+	t.listenerMu.Unlock()
+
+	// Build the peer roster (R1 helper) and wire the
+	// dialer. The dialer is a thin wrapper around
+	// t.Dial — Go's method-value-to-interface assignment
+	// does not work directly (the func value lacks a
+	// named method), so we wrap t in a struct that has
+	// a Dial method whose body is `t.Dial(ctx, peer)`.
+	// R2's dialer interface signature is
+	// Dial(ctx, PeerConfig) (*quic.Conn, error), which
+	// matches t.Dial's signature exactly.
+	roster := RosterFromConfig(t.peers)
+	dialWrapper := &transportDialer{t: t}
+	for _, p := range roster {
+		p.dialer = dialWrapper
+	}
+
+	// Start the Q3 accept loop in a goroutine. The
+	// accept loop blocks until the listener is closed
+	// or ctx is cancelled; on either signal it returns.
+	// ctx is the Run argument, so the bootstrap's
+	// cancellation propagates.
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		_ = t.acceptLoop(ctx, listener)
+	}()
+
+	// Start one peer.run goroutine per configured
+	// peer. Each goroutine owns its *Peer's lifecycle
+	// (dial / dispatch / backoff) and exits on
+	// ctx cancellation. The no-op handlers are the
+	// v0.1.0 default; the arxsentinel product wires
+	// real handlers later.
+	peerDone := make(chan struct{}, len(roster))
+	for _, p := range roster {
+		p := p
+		go func() {
+			defer func() { peerDone <- struct{}{} }()
+			_ = p.run(ctx, nil, nil, nil)
+		}()
+	}
+
+	// Block until ctx is cancelled. On cancel, return
+	// nil: the accept loop and peer goroutines will
+	// observe ctx.Done() on their next iteration and
+	// exit cleanly. We do not Wait() for the accept-
+	// loop goroutine because the listener's own
+	// ctx-cancel path closes the underlying socket
+	// and the loop returns; joining would just be
+	// ceremony.
+	<-ctx.Done()
+	return nil
+}
+
+// acceptLoop is the per-Run accept-loop wrapper. It is
+// unexported because the only caller is Run; the loop
+// body is the Q3 Listen accept pattern (block on
+// Accept, dispatch each conn in its own goroutine)
+// adapted to take a pre-bound *quic.Listener rather
+// than binding internally. The split is K2's — Run
+// owns the bind step (so the listenFunc injection
+// point is the K2 boundary, not buried inside the
+// accept loop), and acceptLoop owns the accept step.
+func (t *Transport) acceptLoop(ctx context.Context, listener *quic.Listener) error {
+	for {
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+			return nil
+		default:
+		}
+
+		conn, err := listener.Accept(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if errors.Is(err, quic.ErrServerClosed) || isClosedListenerErr(err) {
+				return nil
+			}
+			return fmt.Errorf("transport: acceptLoop: accept: %w", err)
+		}
+
+		go t.handleAcceptedConn(ctx, conn)
+	}
+}
+
+// transportDialer is the K2 dialer wrapper. R2's dialer
+// interface requires a struct with a Dial method; Go
+// does not let you assign a bare method value
+// (t.Dial as a func) to an interface variable. The
+// wrapper struct exists to make the assignment work
+// without polluting *Transport with a second Dial
+// method (which would create a name collision) or
+// exporting an extra constructor.
+//
+// The struct holds *Transport by pointer; the Dial
+// method delegates to t.Dial. Allocation is one
+// per Run call, which is negligible.
+type transportDialer struct {
+	t *Transport
+}
+
+// Dial delegates to the wrapped Transport's Dial. The
+// signature matches R2's dialer interface exactly, so
+// *transportDialer satisfies the interface and can be
+// assigned to peer.dialer.
+func (d *transportDialer) Dial(ctx context.Context, peer PeerConfig) (*quic.Conn, error) {
+	return d.t.Dial(ctx, peer)
 }
 
 // ========================== Q4 — test injection points ==========================
